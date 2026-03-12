@@ -1,0 +1,198 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+# ---------------------------------------------------------------------------
+# Project metadata
+# ---------------------------------------------------------------------------
+[project]
+name = "nnx-torch"
+version = "0.1.0"
+description = "Modern, composable PyTorch layers with pluggable attention backends and HuggingFace-style masking."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Dario Arena" },
+]
+keywords = [
+    "pytorch",
+    "deep-learning",
+    "transformers",
+    "attention",
+    "rwkv",
+    "linear-attention",
+    "flash-attention",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+requires-python = ">=3.10"
+
+# ---------------------------------------------------------------------------
+# Mandatory runtime dependencies
+# ---------------------------------------------------------------------------
+# Only PyTorch itself is strictly required. Everything else is optional so
+# that users who only need SDPA (the default backend) do not have to install
+# large extras they will never use.
+dependencies = [
+    "torch>=2.1.0",
+]
+
+
+# ---------------------------------------------------------------------------
+# Optional dependency groups
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+
+# torch.nn.attention.flex_attention — ships with PyTorch >= 2.3
+flex = [
+    "torch>=2.3.0",
+]
+
+# Flash Linear Attention (GLA, DeltaNet, Based, RetNet, …)
+# https://github.com/fla-org/flash-linear-attention
+linear = [
+    "flash-linear-attention>=0.3.0",
+]
+
+# Triton — required by both flex_attention compilation and FLA kernels
+triton = [
+    "triton>=2.2.0",
+]
+
+# Full CUDA-accelerated stack: flex + linear + triton
+cuda = [
+    "torch>=2.3.0",
+    "triton>=2.2.0",
+    "flash-linear-attention>=0.3.0",
+]
+
+# Development tools
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "torch>=2.3.0",       # need flex for full test coverage
+]
+
+# Everything (convenient for contributors)
+all = [
+    "torch>=2.3.0",
+    "triton>=2.2.0",
+    "flash-linear-attention>=0.3.0",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+
+# ---------------------------------------------------------------------------
+# Project URLs
+# ---------------------------------------------------------------------------
+[project.urls]
+Homepage      = "https://github.com/yourname/nnx-torch"
+Documentation = "https://github.com/yourname/nnx-torch#readme"
+Repository    = "https://github.com/yourname/nnx-torch"
+"Bug Tracker" = "https://github.com/yourname/nnx-torch/issues"
+
+
+# ---------------------------------------------------------------------------
+# Hatchling build config
+# ---------------------------------------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["nnx"]
+
+
+# ---------------------------------------------------------------------------
+# uv workspace / tool settings
+# ---------------------------------------------------------------------------
+[tool.uv]
+# Prefer binary wheels — avoids compiling triton/torch from source
+compile-bytecode = true
+
+# Mark torch as a package whose index should be resolved from PyTorch's own
+# index when a CUDA variant is needed.  Users override this via
+# `uv pip install nnx-torch[cuda] --extra-index-url https://download.pytorch.org/whl/cu121`
+# The table below pins the CPU wheel as the default so CI works without GPUs.
+[tool.uv.sources]
+# Remove or override this entry locally if you want a CUDA build of torch.
+# torch = { index = "pytorch-cpu" }
+
+# [[tool.uv.index]]
+# name = "pytorch-cpu"
+# url  = "https://download.pytorch.org/whl/cpu"
+# explicit = true
+
+
+# ---------------------------------------------------------------------------
+# Ruff (linter + formatter)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py310"
+line-length    = 120
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "ANN", # flake8-annotations  (type hints)
+    "NPY", # numpy-specific rules
+]
+ignore = [
+    "ANN101", # missing type annotation for `self`
+    "ANN102", # missing type annotation for `cls`
+    "ANN204", # missing return type for __init__
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nnx"]
+
+
+# ---------------------------------------------------------------------------
+# Mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version         = "3.10"
+strict                 = false
+ignore_missing_imports = true   # torch stubs are incomplete
+warn_return_any        = true
+warn_unused_ignores    = true
+
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths    = ["tests"]
+addopts      = "-v --tb=short"
+filterwarnings = [
+    "ignore::UserWarning",
+    "ignore::DeprecationWarning",
+]
+
+
+# ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source  = ["nnx"]
+omit    = ["tests/*"]
+
+[tool.coverage.report]
+show_missing   = true
+skip_covered   = false
+fail_under     = 70
