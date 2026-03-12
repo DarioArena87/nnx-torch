@@ -393,12 +393,12 @@ class TestLinearAttention:
     def test_linear_attention_variants(self, D, variant):
         """Test LinearAttention with different kernel variants."""
         # Create tensors directly on CUDA with bfloat16 dtype
-        x = torch.randn(2, 10, D, device="cuda", dtype=torch.bfloat16)
-        mask = torch.ones(2, 10, dtype=torch.bool, device="cuda")
+        x = torch.randn(2, 10, D, dtype=torch.bfloat16 if variant == "delta" else None).cuda()
+        mask = torch.ones(2, 10, dtype=torch.bool).cuda()
         mask[0, 7:] = False
         mask[1, 9:] = False
         
-        linear_attn = LinearAttention(embed_dim=D, num_heads=4, variant=variant).to(device="cuda", dtype=torch.bfloat16)
+        linear_attn = LinearAttention(embed_dim=D, num_heads=4, variant=variant).cuda()
         out = linear_attn(x, attention_mask=mask)
         assert out.shape == x.shape
 

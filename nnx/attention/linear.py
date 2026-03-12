@@ -119,6 +119,9 @@ class LinearAttention(nn.Module):
         self._k_dim = k_dim
         self._v_dim = v_dim
 
+        if variant == "delta":
+            self.to(dtype=torch.bfloat16)
+
     def _split(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
         B, T, _ = x.shape
         return x.view(B, T, self.num_heads, head_dim).transpose(1, 2)
