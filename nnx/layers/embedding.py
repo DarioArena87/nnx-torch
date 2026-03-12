@@ -182,7 +182,8 @@ class RotaryEmbedding(nn.Module):
         Apply RoPE to Q and K in-place equivalent.
 
         Args:
-            q, k:   (B, H, T, head_dim) query and key tensors.
+            q: (B, H, T, head_dim) query tensor.
+            k: (B, H, T, head_dim) key tensor.
             offset: Token offset for KV-cache inference.
 
         Returns:

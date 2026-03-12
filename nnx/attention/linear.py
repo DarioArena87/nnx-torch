@@ -89,6 +89,9 @@ class LinearAttention(nn.Module):
         expand_k: float = 1.0,
         expand_v: float = 1.0,
         chunk_size: int = 64, ) -> None:
+
+        assert torch.cuda.is_available(), "CUDA is not available"
+
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
