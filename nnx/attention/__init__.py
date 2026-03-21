@@ -2,7 +2,13 @@ from typing import Optional, Literal
 
 from .base import BaseAttention
 from .flex import FlexAttention
-from .linear import LinearAttention
+from .linear import (
+    LinearAttention,
+    GLAAttention,
+    DeltaAttention,
+    BasedAttention,
+    RetentionAttention,
+)
 from .rwkv import RWKVTimeMixing, RWKV6TimeMixing
 from .rope import RoPEAttention
 from .alibi import ALiBiAttention
@@ -10,7 +16,7 @@ from .sdpa import SDPAttention
 
 
 def build_attention(
-    attn_type: Literal["sdpa", "rwkv", "flex", "linear", "rwkv6", "rope", "alibi"],
+    attn_type: Literal["sdpa", "rwkv", "flex", "linear", "rwkv6", "rope", "alibi", "gla", "delta", "based", "retention"],
     embed_dim: int,
     num_heads: int = 1,
     dropout: float = 0.0,
@@ -26,7 +32,17 @@ def build_attention(
         case "flex":
             return FlexAttention(embed_dim, num_heads, dropout, bias)
         case "linear":
-            return LinearAttention(embed_dim, num_heads, head_dim=head_dim, **kwargs)
+            # Backward compatibility: use variant parameter if provided
+            variant = kwargs.pop("variant", "gla")
+            return LinearAttention(embed_dim, num_heads, head_dim=head_dim, variant=variant, **kwargs)
+        case "gla":
+            return GLAAttention(embed_dim, num_heads, dropout, bias, head_dim, **kwargs)
+        case "delta":
+            return DeltaAttention(embed_dim, num_heads, dropout, bias, head_dim, **kwargs)
+        case "based":
+            return BasedAttention(embed_dim, num_heads, dropout, bias, head_dim, **kwargs)
+        case "retention":
+            return RetentionAttention(embed_dim, num_heads, dropout, bias, head_dim, **kwargs)
         case "rwkv6":
             return RWKV6TimeMixing(embed_dim, num_heads, **kwargs)
         case "rope":

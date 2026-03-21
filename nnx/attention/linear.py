@@ -1,182 +1,649 @@
 """
-Linear Attention backend.
+Linear Attention backends using Flash Linear Attention (FLA) library.
 
-Wraps the ``flash_linear_attention`` library (fla-org/flash-linear-attention)
-which provides O(T) recurrent / chunkwise-parallel linear attention kernels.
+This module provides separate attention classes for each FLA variant:
+- GLAAttention: Gated Linear Attention
+- DeltaAttention: DeltaNet
+- BasedAttention: Based linear attention
+- RetentionAttention: RetNet-style retention
 
-Several variants are supported:
-  - ``"gla"``   — Gated Linear Attention (Yang et al., 2024)
-  - ``"delta"`` — DeltaNet (Schlag et al., 2021 / Yang et al., 2024)
-  - ``"based"`` — Based (Arora et al., 2024)
-  - ``"retention"`` — RetNet-style retention
+All classes inherit from BaseAttention and follow the standard nnx interface.
 
 Requires: pip install flash-linear-attention
 """
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import warnings
 
-_VARIANTS = Literal["gla", "delta", "based", "retention"]
+from .base import BaseAttention
 
 
-def _import_fla(variant: str):
-    """Lazily import the requested FLA kernel."""
+# ----------------------------------------------------------------------
+# Kernel imports (lazy)
+# ----------------------------------------------------------------------
+
+def _import_gla_kernel():
+    """Import GLA kernel."""
     try:
-        if variant == "gla":
-            from fla.ops.gla import chunk_gla
-
-            return chunk_gla
-        elif variant == "delta":
-            from fla.ops.delta_rule import chunk_delta_rule
-
-            return chunk_delta_rule
-        elif variant == "based":
-            from fla.ops.based import parallel_based
-
-            return parallel_based
-        elif variant == "retention":
-            from fla.ops.retention import chunk_retention
-
-            return chunk_retention
-        else:
-            raise ValueError(f"Unknown flash-linear-attention variant: {variant!r}")
+        from fla.ops.gla import chunk_gla
+        return chunk_gla
     except ImportError as exc:
         raise ImportError(
-            "LinearAttention requires the flash-linear-attention library. "
+            "GLAAttention requires the flash-linear-attention library. "
             "Install it with:\n"
             "  pip install flash-linear-attention\n"
             "or visit https://github.com/fla-org/flash-linear-attention",
         ) from exc
 
 
-class LinearAttention(nn.Module):
+def _import_delta_kernel():
+    """Import DeltaNet kernel."""
+    try:
+        from fla.ops.delta_rule import chunk_delta_rule
+        return chunk_delta_rule
+    except ImportError as exc:
+        raise ImportError(
+            "DeltaAttention requires the flash-linear-attention library. "
+            "Install it with:\n"
+            "  pip install flash-linear-attention\n"
+            "or visit https://github.com/fla-org/flash-linear-attention",
+        ) from exc
+
+
+def _import_based_kernel():
+    """Import Based kernel."""
+    try:
+        from fla.ops.based import parallel_based
+        return parallel_based
+    except ImportError as exc:
+        raise ImportError(
+            "BasedAttention requires the flash-linear-attention library. "
+            "Install it with:\n"
+            "  pip install flash-linear-attention\n"
+            "or visit https://github.com/fla-org/flash-linear-attention",
+        ) from exc
+
+
+def _import_retention_kernel():
+    """Import Retention kernel."""
+    try:
+        from fla.ops.retention import chunk_retention
+        return chunk_retention
+    except ImportError as exc:
+        raise ImportError(
+            "RetentionAttention requires the flash-linear-attention library. "
+            "Install it with:\n"
+            "  pip install flash-linear-attention\n"
+            "or visit https://github.com/fla-org/flash-linear-attention",
+        ) from exc
+
+
+# ----------------------------------------------------------------------
+# Base class for FLA variants
+# ----------------------------------------------------------------------
+
+class _FLABaseAttention(BaseAttention):
     """
-    Linear (sub-quadratic) attention using the Flash Linear Attention library.
-
-    Unlike the quadratic backends, linear attention does not compute a full
-    attention matrix, so the semantics of ``attention_mask`` are different:
-    padding tokens are zeroed out *before* the recurrence rather than
-    masked in logit space.
-
-    Args:
-        embed_dim:  Total embedding dimensionality.
-        num_heads:  Number of attention heads.
-        variant:    Which linear-attention kernel to use.
-                    One of ``"gla"``, ``"delta"``, ``"based"``,
-                    ``"retention"``.
-        head_dim:   Per-head dimensionality (default: embed_dim // num_heads).
-        bias:       Whether projection layers include a bias term.
-        expand_k:   Key expansion ratio (GLA / DeltaNet).
-        expand_v:   Value expansion ratio (GLA / DeltaNet).
-        chunk_size: Chunk size for chunkwise-parallel kernels.
-
-    Note:
-        Because linear attention is inherently *causal* (it uses a recurrence), passing ``causal=False`` has no effect — the
-        recurrence always processes left-to-right.
+    Base class for FLA linear attention variants.
+    
+    Handles common setup for FLA kernels: asymmetric projections for
+    keys/values via expand_k/expand_v parameters, and head splitting.
+    
+    Note: Linear attention is inherently causal (uses recurrence), so
+    the causal parameter is ignored — the recurrence always processes
+    left-to-right.
     """
-
+    
     def __init__(
         self,
         embed_dim: int,
         num_heads: int,
-        variant: _VARIANTS = "gla",
-        head_dim: Optional[int] = None,
+        dropout: float = 0.0,
         bias: bool = False,
+        head_dim: Optional[int] = None,
         expand_k: float = 1.0,
         expand_v: float = 1.0,
-        chunk_size: int = 64, ) -> None:
-
-        assert torch.cuda.is_available(), "CUDA is not available"
-
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.variant = variant
-        self.head_dim = head_dim or (embed_dim // num_heads)
-        self.chunk_size = chunk_size
-
-        k_dim = int(self.head_dim * expand_k)
-        v_dim = int(self.head_dim * expand_v)
+        **kwargs,
+    ) -> None:
+        # Validate CUDA availability early
+        assert torch.cuda.is_available(), f"{self.__class__.__name__} requires CUDA"
+        
+        super().__init__(embed_dim, num_heads, dropout, bias, head_dim)
+        
+        # Asymmetric projection dimensions
+        self._k_dim = int(self.head_dim * expand_k)
+        self._v_dim = int(self.head_dim * expand_v)
+        
+        # Override inner dimensions for asymmetric projections
         inner_q = self.head_dim * num_heads
-        inner_k = k_dim * num_heads
-        inner_v = v_dim * num_heads
-
+        inner_k = self._k_dim * num_heads
+        inner_v = self._v_dim * num_heads
+        
+        # Recreate projection layers with correct dimensions
         self.q_proj = nn.Linear(embed_dim, inner_q, bias=bias)
         self.k_proj = nn.Linear(embed_dim, inner_k, bias=bias)
         self.v_proj = nn.Linear(embed_dim, inner_v, bias=bias)
         self.out_proj = nn.Linear(inner_v, embed_dim, bias=bias)
-
-        # GLA / DeltaNet have a gate
-        self._has_gate = variant in ("gla", "delta")
-        if self._has_gate:
-            self.g_proj = nn.Linear(embed_dim, inner_v, bias=bias)
-
-        self._kernel = _import_fla(variant)
-        self._k_dim = k_dim
-        self._v_dim = v_dim
-
-        if variant == "delta":
-            self.to(dtype=torch.bfloat16)
-
-    def _split(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
+        
+        # Initialize kernel (to be done in subclass)
+        self._kernel = None
+    
+    def _split_heads(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
+        """Split tensor into heads: (B, T, D) -> (B, H, T, Dh)"""
         B, T, _ = x.shape
         return x.view(B, T, self.num_heads, head_dim).transpose(1, 2)
-
+    
     def forward(
         self,
         query: torch.Tensor,
         key: Optional[torch.Tensor] = None,
         value: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        causal: bool = True, ) -> torch.Tensor:
+        causal: bool = True,
+    ) -> torch.Tensor:
         """
         Args:
-            query:          (B, T, D)
-            key:            (B, T, D) — defaults to query (self-attention).
-            value:          (B, T, D) — defaults to key.
-            attention_mask: HF-style (B, T) mask.  Padding positions are
-                            zeroed in q/k/v before the recurrence.
-            causal:         Ignored — linear attention is always causal.
-
+            query: (B, Tq, D)
+            key: (B, Tk, D) defaults to query
+            value: (B, Tk, D) defaults to key
+            attention_mask: HF-style (B, Tk) boolean mask (1=real, 0=pad)
+            causal: ignored — linear attention is always causal
+        
         Returns:
-            (B, T, D)
+            (B, Tq, D)
         """
         if key is None:
             key = query
         if value is None:
             value = key
-
-        q = self._split(self.q_proj(query), self.head_dim)
-        k = self._split(self.k_proj(key), self._k_dim)
-        v = self._split(self.v_proj(value), self._v_dim)
-
-        # Apply HF-style mask by zeroing padding positions
+        
+        # Project and split heads
+        q = self._split_heads(self.q_proj(query), self.head_dim)  # (B, H, Tq, Dh)
+        k = self._split_heads(self.k_proj(key), self._k_dim)      # (B, H, Tk, Dh_k)
+        v = self._split_heads(self.v_proj(value), self._v_dim)    # (B, H, Tk, Dh_v)
+        
+        # Apply mask by zeroing padding positions (linear attention semantics)
+        # Only apply to k/v if query length differs (cross-attention)
         if attention_mask is not None:
-            pad = (~attention_mask.bool()).unsqueeze(-1)  # (B, T, 1)
-            q = q.masked_fill(pad.unsqueeze(1), 0.0)
+            pad = (~attention_mask.bool()).unsqueeze(-1)  # (B, Tk, 1)
+            # Always apply to k and v
             k = k.masked_fill(pad.unsqueeze(1), 0.0)
             v = v.masked_fill(pad.unsqueeze(1), 0.0)
-
-        if self.variant == "gla":
-            # GLA expects a gate in (B, H, T, V)
-            g = self._split(torch.sigmoid(self.g_proj(query)), self._v_dim)
-            out, _ = self._kernel(q, k, v, g)
-        elif self.variant == "delta":
-            # DeltaNet expects beta (gate) as the 4th positional argument
-            beta = torch.sigmoid(self.g_proj(query))
-            out, _ = self._kernel(q, k, v, beta)
-        elif self.variant == "based":
-            out = self._kernel(q, k, v)
-        elif self.variant == "retention":
-            out, _ = self._kernel(q, k, v)
-        else:
-            raise ValueError(self.variant)
-
-        # (B, H, T, Dv) → (B, T, H*Dv)
-        B, H, T, Dv = out.shape
-        out = out.transpose(1, 2).contiguous().view(B, T, H * Dv)
+            # Apply to q only if Tq == Tk (self-attention)
+            if q.shape[2] == k.shape[2]:
+                q = q.masked_fill(pad.unsqueeze(1), 0.0)
+        
+        # Call kernel (subclass implements _attend) with original query for gate computation if needed
+        out = self._attend(q, k, v, query)
+        
+        # Merge heads and project
+        out = self._merge_heads(out)  # (B, T, H*Dv)
         return self.out_proj(out)
+    
+    @property
+    def kernel(self):
+        """Lazy-load kernel on first use."""
+        if self._kernel is None:
+            self._kernel = self._import_kernel()
+        return self._kernel
+
+
+# ----------------------------------------------------------------------
+# Gated Linear Attention (GLA)
+# ----------------------------------------------------------------------
+
+class GLAAttention(_FLABaseAttention):
+    """
+    Gated Linear Attention (GLA).
+    
+    Uses the chunk_gla kernel from flash-linear-attention.
+    
+    Args:
+        embed_dim: Total embedding dimensionality.
+        num_heads: Number of attention heads.
+        dropout: Dropout probability (not applied in kernel, used for training).
+        bias: Whether projection layers include bias.
+        head_dim: Per-head dimensionality (default: embed_dim // num_heads).
+        expand_k: Key expansion ratio (default: 1.0).
+        expand_v: Value expansion ratio (default: 1.0).
+    """
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = False,
+        head_dim: Optional[int] = None,
+        expand_k: float = 1.0,
+        expand_v: float = 1.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            embed_dim, num_heads, dropout, bias, head_dim,
+            expand_k=expand_k, expand_v=expand_v, **kwargs
+        )
+        # GLA requires a gate projection; gate dimension must match query dimension
+        inner_g = self.head_dim * num_heads
+        self.g_proj = nn.Linear(embed_dim, inner_g, bias=bias)
+    
+    def _import_kernel(self):
+        return _import_gla_kernel()
+    
+    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """
+        Apply GLA kernel.
+        
+        Args:
+            q: (B, H, Tq, Dh)
+            k: (B, H, Tk, Dh_k)
+            v: (B, H, Tk, Dh_v)
+            query: (B, Tq, D) original query for gate computation
+        
+        Returns:
+            (B, H, Tq, Dh_v)
+        """
+        # GLA requires query and key/value lengths to be equal
+        if q.shape[2] != k.shape[2]:
+            raise ValueError(
+                f"GLAAttention does not support cross-attention with different query/key lengths. "
+                f"Query length: {q.shape[2]}, Key length: {k.shape[2]}"
+            )
+        
+        # GLA expects gate g with shape (B, T, H, Dh) matching q and k
+        B, Tq, _ = query.shape
+        g = torch.sigmoid(self.g_proj(query)).view(B, Tq, self.num_heads, self.head_dim)
+        
+        # Transpose q, k, v from head-first (B, H, T, D) to seq-first (B, T, H, D)
+        q_seq = q.transpose(1, 2).contiguous()
+        k_seq = k.transpose(1, 2).contiguous()
+        v_seq = v.transpose(1, 2).contiguous()
+        
+        # Call kernel: chunk_gla(q, k, v, g) -> (out, latent_state)
+        # Output shape: (B, T, H, Dv)
+        out_seq, _ = self.kernel(q_seq, k_seq, v_seq, g)
+        
+        # Transpose back to head-first (B, H, T, Dv)
+        out = out_seq.transpose(1, 2).contiguous()
+        return out
+
+
+# ----------------------------------------------------------------------
+# DeltaNet Attention
+# ----------------------------------------------------------------------
+
+class DeltaAttention(_FLABaseAttention):
+    """
+    DeltaNet attention using the chunk_delta_rule kernel.
+    
+    DeltaNet is a gated linear attention variant with a simplified gating
+    mechanism. It uses the same asymmetric projection structure as GLA.
+    
+    Note: DeltaNet kernel requires bfloat16 precision. The module is
+    automatically converted to bfloat16 upon initialization.
+    
+    Args:
+        embed_dim: Total embedding dimensionality.
+        num_heads: Number of attention heads.
+        dropout: Dropout probability (not applied in kernel, used for training).
+        bias: Whether projection layers include bias.
+        head_dim: Per-head dimensionality (default: embed_dim // num_heads).
+        expand_k: Key expansion ratio (default: 1.0).
+        expand_v: Value expansion ratio (default: 1.0).
+    """
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = False,
+        head_dim: Optional[int] = None,
+        expand_k: float = 1.0,
+        expand_v: float = 1.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            embed_dim, num_heads, dropout, bias, head_dim,
+            expand_k=expand_k, expand_v=expand_v, **kwargs
+        )
+        # DeltaNet requires a gate projection (beta) that outputs a scalar per head per position
+        # So output features = num_heads
+        self.g_proj = nn.Linear(embed_dim, num_heads, bias=bias)
+        # DeltaNet requires bfloat16 precision
+        self.to(dtype=torch.bfloat16)
+    
+    def _import_kernel(self):
+        return _import_delta_kernel()
+    
+    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """
+        Apply DeltaNet kernel.
+        
+        Args:
+            q: (B, H, Tq, Dh)
+            k: (B, H, Tk, Dh_k)
+            v: (B, H, Tk, Dh_v)
+            query: (B, Tq, D) original query for gate computation
+        
+        Returns:
+            (B, H, Tq, Dh_v) in bfloat16
+        """
+        # DeltaNet requires query and key/value lengths to be equal
+        if q.shape[2] != k.shape[2]:
+            raise ValueError(
+                f"DeltaAttention does not support cross-attention with different query/key lengths. "
+                f"Query length: {q.shape[2]}, Key length: {k.shape[2]}"
+            )
+        
+        # DeltaNet expects beta with shape (B, H, T)
+        B, Tq, _ = query.shape
+        # Project to (B, Tq, H) and transpose to (B, H, Tq)
+        beta = torch.sigmoid(self.g_proj(query)).transpose(1, 2).contiguous()
+        
+        # Transpose q, k, v from head-first (B, H, T, D) to seq-first (B, T, H, D)
+        q_seq = q.transpose(1, 2).contiguous()
+        k_seq = k.transpose(1, 2).contiguous()
+        v_seq = v.transpose(1, 2).contiguous()
+        
+        # Call kernel: chunk_delta_rule(q, k, v, beta) -> (out, latent_state)
+        # head_first=False (default) because we passed seq-first tensors
+        out_seq, _ = self.kernel(q_seq, k_seq, v_seq, beta)
+        
+        # Transpose back to head-first (B, H, T, Dv)
+        out = out_seq.transpose(1, 2).contiguous()
+        return out
+
+
+# ----------------------------------------------------------------------
+# Based Linear Attention
+# ----------------------------------------------------------------------
+
+class BasedAttention(_FLABaseAttention):
+    """
+    Based linear attention using the parallel_based kernel.
+    
+    Based attention does not use a gate and has a simpler interface.
+    
+    Note: Based kernel requires all sequences to have the same length.
+    Cross-attention with different query/key lengths is not supported.
+    
+    Args:
+        embed_dim: Total embedding dimensionality.
+        num_heads: Number of attention heads.
+        dropout: Dropout probability (not applied in kernel, used for training).
+        bias: Whether projection layers include bias.
+        head_dim: Per-head dimensionality (default: embed_dim // num_heads).
+        expand_k: Key expansion ratio (default: 1.0).
+        expand_v: Value expansion ratio (default: 1.0).
+    """
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = False,
+        head_dim: Optional[int] = None,
+        expand_k: float = 1.0,
+        expand_v: float = 1.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            embed_dim, num_heads, dropout, bias, head_dim,
+            expand_k=expand_k, expand_v=expand_v, **kwargs
+        )
+        # Based does not have a gate projection
+    
+    def _import_kernel(self):
+        return _import_based_kernel()
+    
+    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Based kernel.
+        
+        Args:
+            q: (B, H, Tq, Dh)
+            k: (B, H, Tk, Dh_k)
+            v: (B, H, Tk, Dh_v)
+            query: (B, Tq, D) original query (unused)
+        
+        Returns:
+            (B, H, Tq, Dh_v)
+        """
+        # parallel_based expects all sequences to have same length
+        if q.shape[2] != k.shape[2]:
+            raise ValueError(
+                f"BasedAttention does not support cross-attention with different query/key lengths. "
+                f"Query length: {q.shape[2]}, Key length: {k.shape[2]}"
+            )
+        
+        # Transpose q, k, v from head-first (B, H, T, D) to seq-first (B, T, H, D)
+        q_seq = q.transpose(1, 2).contiguous()
+        k_seq = k.transpose(1, 2).contiguous()
+        v_seq = v.transpose(1, 2).contiguous()
+        
+        # parallel_based returns output with shape (B, T, H, Dv)
+        # head_first=False (default)
+        out_seq = self.kernel(q_seq, k_seq, v_seq)
+        
+        # Transpose back to head-first (B, H, T, Dv)
+        out = out_seq.transpose(1, 2).contiguous()
+        return out
+
+
+# ----------------------------------------------------------------------
+# Retention Attention
+# ----------------------------------------------------------------------
+
+class RetentionAttention(_FLABaseAttention):
+    """
+    Retention-style linear attention using the chunk_retention kernel.
+    
+    Retention attention is similar to GLA but without a learned gate.
+    
+    Note: Retention kernel requires all sequences to have the same length.
+    Cross-attention with different query/key lengths is not supported.
+    
+    Args:
+        embed_dim: Total embedding dimensionality.
+        num_heads: Number of attention heads.
+        dropout: Dropout probability (not applied in kernel, used for training).
+        bias: Whether projection layers include bias.
+        head_dim: Per-head dimensionality (default: embed_dim // num_heads).
+        expand_k: Key expansion ratio (default: 1.0).
+        expand_v: Value expansion ratio (default: 1.0).
+    """
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = False,
+        head_dim: Optional[int] = None,
+        expand_k: float = 1.0,
+        expand_v: float = 1.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            embed_dim, num_heads, dropout, bias, head_dim,
+            expand_k=expand_k, expand_v=expand_v, **kwargs
+        )
+        # Retention does not have a gate projection
+    
+    def _import_kernel(self):
+        return _import_retention_kernel()
+    
+    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Retention kernel.
+        
+        Args:
+            q: (B, H, Tq, Dh)
+            k: (B, H, Tk, Dh_k)
+            v: (B, H, Tk, Dh_v)
+            query: (B, Tq, D) original query (unused)
+        
+        Returns:
+            (B, H, Tq, Dh_v)
+        """
+        # chunk_retention requires all sequences to have same length
+        if q.shape[2] != k.shape[2]:
+            raise ValueError(
+                f"RetentionAttention does not support cross-attention with different query/key lengths. "
+                f"Query length: {q.shape[2]}, Key length: {k.shape[2]}"
+            )
+        
+        # Transpose q, k, v from head-first (B, H, T, D) to seq-first (B, T, H, D)
+        q_seq = q.transpose(1, 2).contiguous()
+        k_seq = k.transpose(1, 2).contiguous()
+        v_seq = v.transpose(1, 2).contiguous()
+        
+        # chunk_retention returns (out, latent_state) with out shape (B, T, H, Dv)
+        # head_first=False (default)
+        out_seq, _ = self.kernel(q_seq, k_seq, v_seq)
+        
+        # Transpose back to head-first (B, H, T, Dv)
+        out = out_seq.transpose(1, 2).contiguous()
+        return out
+
+
+# ----------------------------------------------------------------------
+# Backward compatibility: LinearAttention as a factory
+# ----------------------------------------------------------------------
+
+class LinearAttention(nn.Module):
+    """
+    Backward-compatible factory for linear attention variants.
+    
+    This class maintains the old interface for backward compatibility.
+    It forwards to the appropriate specialized class based on the variant.
+    
+    Args:
+        embed_dim: Total embedding dimensionality.
+        num_heads: Number of attention heads.
+        variant: Which linear-attention kernel to use ("gla", "delta", "based", "retention").
+        head_dim: Per-head dimensionality (default: embed_dim // num_heads).
+        bias: Whether projection layers include a bias term.
+        expand_k: Key expansion ratio (GLA / DeltaNet).
+        expand_v: Value expansion ratio (GLA / DeltaNet).
+        **kwargs: Additional arguments passed to the underlying implementation.
+    
+    Note:
+        - Linear attention is inherently causal (uses recurrence), so causal is ignored.
+        - All variants require CUDA.
+        - DeltaNet automatically converts to bfloat16.
+    """
+    
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        variant: str = "gla",
+        head_dim: Optional[int] = None,
+        bias: bool = False,
+        expand_k: float = 1.0,
+        expand_v: float = 1.0,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        
+        # Map variant to class
+        variant_map = {
+            "gla": GLAAttention,
+            "delta": DeltaAttention,
+            "based": BasedAttention,
+            "retention": RetentionAttention,
+        }
+        
+        if variant not in variant_map:
+            raise ValueError(
+                f"Unknown linear attention variant: {variant!r}. "
+                f"Choose from {list(variant_map.keys())}"
+            )
+        
+        # Create the actual attention module
+        self._impl = variant_map[variant](
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            bias=bias,
+            head_dim=head_dim,
+            expand_k=expand_k,
+            expand_v=expand_v,
+            **kwargs,
+        )
+        
+        # Proxy attributes for compatibility
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.variant = variant
+        self.head_dim = head_dim or (embed_dim // num_heads)
+    
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+        value: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        causal: bool = True,
+    ) -> torch.Tensor:
+        return self._impl(query, key, value, attention_mask, causal)
+    
+    # Proxy other common methods
+    def train(self, mode: bool = True):
+        self._impl.train(mode)
+        return self
+    
+    def eval(self):
+        self._impl.eval()
+        return self
+    
+    def parameters(self, recurse: bool = True):
+        return self._impl.parameters(recurse)
+    
+    def named_parameters(self, prefix: str = "", recurse: bool = True):
+        return self._impl.named_parameters(prefix, recurse)
+    
+    def modules(self, recurse: bool = True):
+        return self._impl.modules(recurse)
+    
+    def apply(self, fn):
+        self._impl.apply(fn)
+        return self
+    
+    def to(self, *args, **kwargs):
+        self._impl.to(*args, **kwargs)
+        return self
+    
+    def cuda(self, device: Optional[torch.device] = None):
+        self._impl.cuda(device)
+        return self
+    
+    def cpu(self):
+        self._impl.cpu()
+        return self
+    
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        return self._impl.state_dict(destination, prefix, keep_vars)
+    
+    def load_state_dict(self, state_dict, strict=True):
+        return self._impl.load_state_dict(state_dict, strict)
+    
+    def __getattr__(self, name):
+        # Delegate to _impl submodule (stored in _modules)
+        try:
+            impl = self._modules['_impl']
+        except KeyError:
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+        if name == '_impl':
+            return impl
+        return getattr(impl, name)
+    
+    def __repr__(self):
+        return f"LinearAttention(variant={self.variant}, impl={repr(self._impl)})"
