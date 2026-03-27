@@ -71,24 +71,31 @@ class RoPEAttention(BaseAttention):
         k: torch.Tensor,
         v: torch.Tensor,
         attn_bias: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Sequence lengths
         Tq = q.shape[2]
         Tk = k.shape[2]
 
-        if Tq == Tk:
-            # Self-attention: use the standard rotate_queries_keys
-            q, k = self.rope.rotate_queries_keys(q, k)
+        if position_ids is None:
+            # Backward compatible: use sequential positions
+            if Tq == Tk:
+                # Self-attention: use the standard rotate_queries_keys
+                q, k = self.rope.rotate_queries_keys(q, k)
+            else:
+                # Cross-attention: apply RoPE separately with offset=0
+                # Rotate queries
+                cos_q = self.rope.cos_cached[:Tq].unsqueeze(0).unsqueeze(0)
+                sin_q = self.rope.sin_cached[:Tq].unsqueeze(0).unsqueeze(0)
+                q = q * cos_q + self.rope._rotate_half(q) * sin_q
+                # Rotate keys
+                cos_k = self.rope.cos_cached[:Tk].unsqueeze(0).unsqueeze(0)
+                sin_k = self.rope.sin_cached[:Tk].unsqueeze(0).unsqueeze(0)
+                k = k * cos_k + self.rope._rotate_half(k) * sin_k
         else:
-            # Cross-attention: apply RoPE separately with offset=0
-            # Rotate queries
-            cos_q = self.rope.cos_cached[:Tq].unsqueeze(0).unsqueeze(0)
-            sin_q = self.rope.sin_cached[:Tq].unsqueeze(0).unsqueeze(0)
-            q = q * cos_q + self.rope._rotate_half(q) * sin_q
-            # Rotate keys
-            cos_k = self.rope.cos_cached[:Tk].unsqueeze(0).unsqueeze(0)
-            sin_k = self.rope.sin_cached[:Tk].unsqueeze(0).unsqueeze(0)
-            k = k * cos_k + self.rope._rotate_half(k) * sin_k
+            # Use explicit position_ids
+            q = self.rope.rotate_with_positions(q, position_ids)
+            k = self.rope.rotate_with_positions(k, position_ids)
 
         # Scaled dot-product attention
         return F.scaled_dot_product_attention(

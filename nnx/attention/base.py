@@ -79,10 +79,12 @@ class BaseAttention(nn.Module, abc.ABC):
 
     @abc.abstractmethod
     def _attend(
-        self, q: torch.Tensor,  # (B, H, Tq, Dh)
+        self,
+        q: torch.Tensor,  # (B, H, Tq, Dh)
         k: torch.Tensor,  # (B, H, Tk, Dh)
         v: torch.Tensor,  # (B, H, Tk, Dh)
         attn_bias: Optional[torch.Tensor],  # broadcastable additive bias
+        position_ids: Optional[torch.Tensor],  # (B, T) or (T,)
     ) -> torch.Tensor:  # (B, H, Tq, Dh)
         """Core attention computation — implemented by each backend."""
 
@@ -96,6 +98,7 @@ class BaseAttention(nn.Module, abc.ABC):
         key: Optional[torch.Tensor] = None,
         value: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         causal: bool = False, ) -> torch.Tensor:
         """
         Args:
@@ -107,6 +110,9 @@ class BaseAttention(nn.Module, abc.ABC):
                             ``1``/``True`` marks *real* positions and
                             ``0``/``False`` marks *padding*.  Shape can be
                             (B, Tk) or any broadcastable additive bias.
+            position_ids:   (B, T) or (T,) position indices. If None, positions
+                            are assumed to be [0, 1, 2, ...]. Used for RoPE/ALiBi
+                            to support chunked sequences.
             causal:         If True, apply a causal (autoregressive) mask
                             on top of ``attention_mask``.
 
@@ -142,7 +148,7 @@ class BaseAttention(nn.Module, abc.ABC):
         attn_bias = combine_masks(*bias_parts)
 
         # Attend
-        out = self._attend(q, k, v, attn_bias)
+        out = self._attend(q, k, v, attn_bias, position_ids)
 
         # Merge heads and project
         return self.out_proj(self._merge_heads(out))

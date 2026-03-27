@@ -220,6 +220,72 @@ class TestRotaryEmbedding:
         assert q.grad is not None
         assert k.grad is not None
 
+    def test_rotate_with_positions_basic(self, D):
+        """Test RotaryEmbedding.rotate_with_positions with explicit positions."""
+        rope = RotaryEmbedding(head_dim=32, max_len=512)
+        B, H, T = 2, 4, 10
+        x = torch.randn(B, H, T, 32)
+        # Use non-sequential positions
+        position_ids = torch.arange(100, 100 + T).unsqueeze(0).expand(B, -1)
+        rotated = rope.rotate_with_positions(x, position_ids)
+        assert rotated.shape == x.shape
+
+    def test_rotate_with_positions_1d_position_ids(self, D):
+        """Test with 1D position_ids (shape T)."""
+        rope = RotaryEmbedding(head_dim=32, max_len=512)
+        B, H, T = 2, 4, 10
+        x = torch.randn(B, H, T, 32)
+        position_ids = torch.arange(50, 50 + T)  # 1D
+        rotated = rope.rotate_with_positions(x, position_ids)
+        assert rotated.shape == x.shape
+
+    def test_rotate_with_positions_batch_varying(self, D):
+        """Test with different positions for each batch."""
+        rope = RotaryEmbedding(head_dim=32, max_len=512)
+        B, H, T = 2, 4, 10
+        x = torch.randn(B, H, T, 32)
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                                     [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]])
+        rotated = rope.rotate_with_positions(x, position_ids)
+        assert rotated.shape == x.shape
+
+    def test_rotate_with_positions_large_offset(self, D):
+        """Test with very large position offset (requires large max_len)."""
+        # Use a large max_len to accommodate the offset
+        rope = RotaryEmbedding(head_dim=32, max_len=1_000_010)
+        B, H, T = 2, 4, 10
+        x = torch.randn(B, H, T, 32)
+        position_ids = torch.arange(1_000_000, 1_000_000 + T).unsqueeze(0).expand(B, -1)
+        rotated = rope.rotate_with_positions(x, position_ids)
+        assert rotated.shape == x.shape
+        assert torch.all(torch.isfinite(rotated))
+
+    def test_rotate_with_positions_gradients(self, D):
+        """Test gradients flow through rotate_with_positions."""
+        rope = RotaryEmbedding(head_dim=32, max_len=512)
+        B, H, T = 2, 4, 10
+        x = torch.randn(B, H, T, 32, requires_grad=True)
+        position_ids = torch.arange(50, 50 + T).unsqueeze(0).expand(B, -1)
+        rotated = rope.rotate_with_positions(x, position_ids)
+        loss = rotated.sum()
+        loss.backward()
+        assert x.grad is not None
+
+    def test_rotate_with_positions_consistency(self, D):
+        """Test that rotate_with_positions gives same result as rotate_queries_keys with offset for sequential positions."""
+        rope = RotaryEmbedding(head_dim=32, max_len=512)
+        B, H, T = 2, 4, 10
+        x = torch.randn(B, H, T, 32)
+        # Method 1: rotate_with_positions with sequential positions
+        position_ids = torch.arange(T).unsqueeze(0).expand(B, -1)
+        rotated1 = rope.rotate_with_positions(x, position_ids)
+        
+        # Method 2: rotate_queries_keys with offset=0
+        rotated2_q, rotated2_k = rope.rotate_queries_keys(x, x, offset=0)
+        
+        # Should be identical
+        assert torch.allclose(rotated1, rotated2_q)
+
 
 class TestALiBiEmbedding:
     """Test suite for ALiBiEmbedding."""
@@ -271,6 +337,83 @@ class TestALiBiEmbedding:
         if torch.cuda.is_available():
             bias_cuda = alibi(10, device=torch.device("cuda"))
             assert bias_cuda.device.type == "cuda"
+
+    def test_with_positions_basic(self):
+        """Test ALiBiEmbedding.with_positions with explicit positions."""
+        alibi = ALiBiEmbedding(num_heads=4)
+        T = 10
+        position_ids = torch.arange(1000, 1000 + T).unsqueeze(0)  # (1, T)
+        bias = alibi.with_positions(position_ids, torch.device("cpu"))
+        assert bias.shape == (1, 4, T, T)
+
+    def test_with_positions_1d(self):
+        """Test with 1D position_ids."""
+        alibi = ALiBiEmbedding(num_heads=4)
+        T = 10
+        position_ids = torch.arange(50, 50 + T)  # (T,)
+        bias = alibi.with_positions(position_ids, torch.device("cpu"))
+        assert bias.shape == (1, 4, T, T)
+
+    def test_with_positions_batch_varying(self):
+        """Test with different positions per batch."""
+        alibi = ALiBiEmbedding(num_heads=4)
+        position_ids = torch.tensor([[0, 1, 2, 3, 4],
+                                     [100, 101, 102, 103, 104]])
+        bias = alibi.with_positions(position_ids, torch.device("cpu"))
+        B, T = position_ids.shape
+        assert bias.shape == (B, 4, T, T)
+
+    def test_with_positions_cross_attention(self):
+        """Test with different Q and K lengths (using same position space)."""
+        alibi = ALiBiEmbedding(num_heads=4)
+        # For cross-attention, we have different lengths for Q and K
+        # but position_ids corresponds to the key positions
+        kv_T = 15
+        position_ids = torch.arange(50, 50 + kv_T).unsqueeze(0)  # (1, Tk)
+        bias = alibi.with_positions(position_ids, torch.device("cpu"))
+        # The bias will be (1, 4, Tk, Tk) - for keys
+        assert bias.shape == (1, 4, kv_T, kv_T)
+
+    def test_with_positions_large_offset(self):
+        """Test with very large position offset."""
+        alibi = ALiBiEmbedding(num_heads=4)
+        T = 10
+        position_ids = torch.arange(1_000_000, 1_000_000 + T).unsqueeze(0)
+        bias = alibi.with_positions(position_ids, torch.device("cpu"))
+        assert bias.shape == (1, 4, T, T)
+        # Verify no NaN/Inf
+        assert torch.all(torch.isfinite(bias))
+
+    def test_with_positions_slopes_applied_correctly(self):
+        """Test that slopes are correctly applied to bias."""
+        alibi = ALiBiEmbedding(num_heads=2)
+        T = 5
+        position_ids = torch.arange(0, T).unsqueeze(0)  # (1, T)
+        bias = alibi.with_positions(position_ids, torch.device("cpu"))
+        # Bias should be negative or zero
+        assert torch.all(bias <= 0)
+        # For each head, bias should be more negative for larger distances
+        for h in range(2):
+            for i in range(T):
+                for j in range(T):
+                    dist = abs(i - j)
+                    if dist > 0:
+                        # Check that bias is negative
+                        assert bias[0, h, i, j] < 0
+
+    def test_with_positions_consistency_with_forward(self):
+        """Test that with_positions gives consistent results with forward for sequential positions."""
+        alibi = ALiBiEmbedding(num_heads=4)
+        T = 10
+        # Method 1: using forward with seq_len
+        bias1 = alibi(T, torch.device("cpu"))  # (1, 4, T, T)
+        
+        # Method 2: using with_positions with sequential positions [0, 1, ..., T-1]
+        position_ids = torch.arange(T).unsqueeze(0)
+        bias2 = alibi.with_positions(position_ids, torch.device("cpu"))
+        
+        # Should be identical
+        assert torch.allclose(bias1, bias2)
 
 
 if __name__ == "__main__":

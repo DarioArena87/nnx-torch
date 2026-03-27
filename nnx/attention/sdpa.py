@@ -45,6 +45,7 @@ class SDPAttention(BaseAttention):
         k: torch.Tensor,
         v: torch.Tensor,
         attn_bias: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # torch.nn.functional.scaled_dot_product_attention accepts an
         # *additive* attn_mask (identical to our convention).

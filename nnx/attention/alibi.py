@@ -63,17 +63,22 @@ class ALiBiAttention(BaseAttention):
         k: torch.Tensor,
         v: torch.Tensor,
         attn_bias: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Sequence lengths
         Tq = q.shape[2]
         Tk = k.shape[2]
-        T = max(Tq, Tk)
 
-        # Generate ALiBi bias for the maximum length, then slice to actual sizes
-        # alibi(T, device) returns (1, H, T, T)
-        alibi_bias = self.alibi(T, k.device)
-        # Slice to (1, H, Tq, Tk) to match Q-K dimensions
-        alibi_bias = alibi_bias[:, :, :Tq, :Tk]
+        if position_ids is None:
+            # Backward compatible: use sequential positions
+            T = max(Tq, Tk)
+            alibi_bias = self.alibi(T, k.device)
+            alibi_bias = alibi_bias[:, :, :Tq, :Tk]
+        else:
+            # Use explicit position_ids
+            alibi_bias = self.alibi.with_positions(position_ids, k.device)
+            # Slice to match Q-K dimensions if needed
+            alibi_bias = alibi_bias[:, :, :Tq, :Tk]
 
         # Combine with any provided attention bias
         if attn_bias is not None:

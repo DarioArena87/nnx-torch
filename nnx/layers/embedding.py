@@ -204,6 +204,44 @@ class RotaryEmbedding(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.rotate_queries_keys(q, k, offset=offset)
 
+    def rotate_with_positions(
+        self,
+        x: torch.Tensor,           # (B, H, T, D)
+        position_ids: torch.Tensor, # (B, T) or (T,)
+    ) -> torch.Tensor:
+        """
+        Apply RoPE using explicit position indices.
+
+        Supports chunked sequences where position_ids may be [2049, 2050, ...].
+
+        Args:
+            x: (B, H, T, head_dim) tensor to rotate.
+            position_ids: (B, T) or (T,) position indices.
+
+        Returns:
+            Rotated tensor.
+        """
+        # Ensure position_ids is 2D (B, T) for consistent indexing
+        if position_ids.dim() == 1:
+            # (T,) -> (1, T) -> broadcast to (B, T)
+            position_ids = position_ids.unsqueeze(0)
+            # Will broadcast to batch dimension
+
+        # Get cos/sin for each position: (B, T, D)
+        cos = self.cos_cached[position_ids]  # (B, T, D)
+        sin = self.sin_cached[position_ids]  # (B, T, D)
+
+        # Reshape for broadcasting: (B, 1, T, D)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
+        return x * cos + self._rotate_half(x) * sin
+
+    def _extend_cache(self, seq_len: int) -> None:
+        """Extend the cos/sin cache to accommodate longer sequences."""
+        dtype = self.cos_cached.dtype
+        self._build_cache(seq_len, dtype)
+
 
 # ---------------------------------------------------------------------------
 # ALiBi — Attention with Linear Biases
@@ -266,3 +304,38 @@ class ALiBiEmbedding(nn.Module):
         # (H, 1, 1) * (1, T, T) → (H, T, T)
         bias = -self.slopes.to(device)[:, None, None] * dist.abs().unsqueeze(0)
         return bias.unsqueeze(0)  # (1, H, T, T)
+
+    def with_positions(
+        self,
+        position_ids: torch.Tensor,  # (B, T) or (T,)
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Compute ALiBi bias using explicit position indices.
+
+        Supports chunked sequences where position_ids may be [2049, 2050, ...].
+
+        Args:
+            position_ids: (B, T) or (T,) position indices.
+            device: Target device.
+
+        Returns:
+            (B, H, Tq, Tk) additive ALiBi bias matrix.
+        """
+        # Ensure position_ids is 2D: (B, T)
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)  # (1, T)
+
+        B, T = position_ids.shape
+
+        # Get positions for queries and keys
+        # position_ids: (B, T) representing absolute positions
+        # We need relative distances between all query and key positions
+        q_pos = position_ids.unsqueeze(2)  # (B, T, 1)
+        k_pos = position_ids.unsqueeze(1)  # (B, 1, T)
+        dist = (q_pos - k_pos).abs()  # (B, T, T)
+
+        # Apply slopes: (H, 1, 1) * (B, T, T) -> (B, H, T, T)
+        bias = -self.slopes.to(device)[None, :, None, None] * dist.unsqueeze(1).to(device)
+
+        return bias  # (B, H, T, T)

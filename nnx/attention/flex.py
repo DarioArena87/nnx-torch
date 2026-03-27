@@ -80,7 +80,14 @@ class FlexAttention(BaseAttention):
         self.block_mask = block_mask
         self._flex_attention, _ = _import_flex()
 
-    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_bias: Optional[torch.Tensor], ) -> torch.Tensor:
+    def _attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_bias: Optional[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         # flex_attention uses score_mod for custom biases; additive biases
         # from padding masks are composed on top if provided.
 

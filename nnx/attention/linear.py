@@ -144,6 +144,7 @@ class _FLABaseAttention(BaseAttention):
         key: Optional[torch.Tensor] = None,
         value: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         causal: bool = True,
     ) -> torch.Tensor:
         """
@@ -152,6 +153,7 @@ class _FLABaseAttention(BaseAttention):
             key: (B, Tk, D) defaults to query
             value: (B, Tk, D) defaults to key
             attention_mask: HF-style (B, Tk) boolean mask (1=real, 0=pad)
+            position_ids: (B, T) or (T,) position indices (ignored by linear attention)
             causal: ignored — linear attention is always causal
         
         Returns:
@@ -179,7 +181,7 @@ class _FLABaseAttention(BaseAttention):
                 q = q.masked_fill(pad.unsqueeze(1), 0.0)
         
         # Call kernel (subclass implements _attend) with original query for gate computation if needed
-        out = self._attend(q, k, v, query)
+        out = self._attend(q, k, v, query, position_ids)
         
         # Merge heads and project
         out = self._merge_heads(out)  # (B, T, H*Dv)
@@ -235,7 +237,14 @@ class GLAAttention(_FLABaseAttention):
     def _import_kernel(self):
         return _import_gla_kernel()
     
-    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    def _attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         """
         Apply GLA kernel.
         
@@ -244,6 +253,7 @@ class GLAAttention(_FLABaseAttention):
             k: (B, H, Tk, Dh_k)
             v: (B, H, Tk, Dh_v)
             query: (B, Tq, D) original query for gate computation
+            position_ids: ignored (present for interface compatibility)
         
         Returns:
             (B, H, Tq, Dh_v)
@@ -321,7 +331,14 @@ class DeltaAttention(_FLABaseAttention):
     def _import_kernel(self):
         return _import_delta_kernel()
     
-    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    def _attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         """
         Apply DeltaNet kernel.
         
@@ -330,6 +347,7 @@ class DeltaAttention(_FLABaseAttention):
             k: (B, H, Tk, Dh_k)
             v: (B, H, Tk, Dh_v)
             query: (B, Tq, D) original query for gate computation
+            position_ids: ignored (present for interface compatibility)
         
         Returns:
             (B, H, Tq, Dh_v) in bfloat16
@@ -403,7 +421,14 @@ class BasedAttention(_FLABaseAttention):
     def _import_kernel(self):
         return _import_based_kernel()
     
-    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    def _attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         """
         Apply Based kernel.
         
@@ -412,6 +437,7 @@ class BasedAttention(_FLABaseAttention):
             k: (B, H, Tk, Dh_k)
             v: (B, H, Tk, Dh_v)
             query: (B, Tq, D) original query (unused)
+            position_ids: ignored (present for interface compatibility)
         
         Returns:
             (B, H, Tq, Dh_v)
@@ -480,7 +506,14 @@ class RetentionAttention(_FLABaseAttention):
     def _import_kernel(self):
         return _import_retention_kernel()
     
-    def _attend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    def _attend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         """
         Apply Retention kernel.
         
@@ -489,6 +522,7 @@ class RetentionAttention(_FLABaseAttention):
             k: (B, H, Tk, Dh_k)
             v: (B, H, Tk, Dh_v)
             query: (B, Tq, D) original query (unused)
+            position_ids: ignored (present for interface compatibility)
         
         Returns:
             (B, H, Tq, Dh_v)
@@ -591,9 +625,10 @@ class LinearAttention(nn.Module):
         key: Optional[torch.Tensor] = None,
         value: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         causal: bool = True,
     ) -> torch.Tensor:
-        return self._impl(query, key, value, attention_mask, causal)
+        return self._impl(query, key, value, attention_mask, position_ids, causal)
     
     # Proxy other common methods
     def train(self, mode: bool = True):

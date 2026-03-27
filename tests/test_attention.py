@@ -134,6 +134,78 @@ class TestRoPEAttention:
         for param in attn.parameters():
             assert param.grad is not None
 
+    def test_with_explicit_position_ids(self, x, D):
+        """Test with explicit position_ids (non-sequential)."""
+        attn = RoPEAttention(embed_dim=D, num_heads=4)
+        B, T = x.shape[:2]
+        # Create non-sequential position IDs (e.g., chunked sequences)
+        position_ids = torch.arange(1000, 1000 + T).unsqueeze(0).expand(B, -1)
+        out = attn(x, position_ids=position_ids)
+        assert out.shape == x.shape
+
+    def test_position_ids_vs_sequential(self, D):
+        """Test that explicit position_ids produce different results vs sequential."""
+        attn = RoPEAttention(embed_dim=D, num_heads=4)
+        x = torch.randn(2, 10, D)
+        
+        # Without position_ids (sequential positions 0,1,2,...)
+        out_seq = attn(x)
+        
+        # With explicit position_ids starting at offset
+        position_ids = torch.arange(100, 110).unsqueeze(0).expand(2, -1)
+        out_pos = attn(x, position_ids=position_ids)
+        
+        # Results should differ due to different rotations
+        assert not torch.allclose(out_seq, out_pos)
+
+    def test_batch_varying_position_ids(self, D):
+        """Test with different position_ids for each batch element."""
+        attn = RoPEAttention(embed_dim=D, num_heads=4)
+        x = torch.randn(2, 10, D)
+        # Different starting positions for each batch
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                                     [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]])
+        out = attn(x, position_ids=position_ids)
+        assert out.shape == x.shape
+
+    def test_position_ids_single_token(self, D):
+        """Test with single token sequence and position_ids."""
+        attn = RoPEAttention(embed_dim=D, num_heads=4)
+        x = torch.randn(2, 1, D)
+        position_ids = torch.tensor([[100], [200]])
+        out = attn(x, position_ids=position_ids)
+        assert out.shape == x.shape
+
+    def test_position_ids_large_offset(self, D):
+        """Test with very large position offset (e.g., 1e6)."""
+        # Increase max_len to accommodate large position IDs
+        attn = RoPEAttention(embed_dim=D, num_heads=4, max_len=1_000_010)
+        x = torch.randn(2, 10, D)
+        position_ids = torch.arange(1_000_000, 1_000_010).unsqueeze(0).expand(2, -1)
+        out = attn(x, position_ids=position_ids)
+        assert out.shape == x.shape
+        # Verify no NaN/Inf
+        assert torch.all(torch.isfinite(out))
+
+    def test_position_ids_with_causal(self, D):
+        """Test position_ids combined with causal masking."""
+        attn = RoPEAttention(embed_dim=D, num_heads=4)
+        x = torch.randn(2, 10, D)
+        position_ids = torch.arange(100, 110).unsqueeze(0).expand(2, -1)
+        out = attn(x, causal=True, position_ids=position_ids)
+        assert out.shape == x.shape
+
+    def test_position_ids_with_padding_mask(self, D):
+        """Test position_ids with padding mask."""
+        attn = RoPEAttention(embed_dim=D, num_heads=4)
+        x = torch.randn(2, 10, D)
+        mask = torch.ones(2, 10, dtype=torch.bool)
+        mask[0, 7:] = False
+        mask[1, 9:] = False
+        position_ids = torch.arange(100, 110).unsqueeze(0).expand(2, -1)
+        out = attn(x, attention_mask=mask, position_ids=position_ids)
+        assert out.shape == x.shape
+
 
 # ============================================================================
 # ALiBiAttention Tests
@@ -245,6 +317,74 @@ class TestALiBiAttention:
         # Access the alibi module and generate bias
         bias = attn.alibi(seq_len, torch.device("cpu"))
         assert bias.shape == (1, 4, seq_len, seq_len)
+
+    def test_with_explicit_position_ids(self, x, D):
+        """Test with explicit position_ids (non-sequential)."""
+        attn = ALiBiAttention(embed_dim=D, num_heads=4)
+        B, T = x.shape[:2]
+        # Create non-sequential position IDs (e.g., chunked sequences)
+        position_ids = torch.arange(1000, 1000 + T).unsqueeze(0).expand(B, -1)
+        out = attn(x, position_ids=position_ids)
+        assert out.shape == x.shape
+
+    def test_position_ids_offset_equivalence(self, D):
+        """Test that ALiBi with offset position_ids gives same result as sequential.
+        
+        ALiBi only depends on relative distances, so absolute position offset
+        should not affect the output (for self-attention with same positions).
+        """
+        attn = ALiBiAttention(embed_dim=D, num_heads=4)
+        x = torch.randn(2, 10, D)
+        
+        # Without position_ids (sequential positions 0,1,2,...)
+        out_seq = attn(x)
+        
+        # With explicit position_ids starting at offset
+        position_ids = torch.arange(100, 110).unsqueeze(0).expand(2, -1)
+        out_pos = attn(x, position_ids=position_ids)
+        
+        # Results should be identical because relative distances are the same
+        assert torch.allclose(out_seq, out_pos)
+
+    def test_batch_varying_position_ids(self, D):
+        """Test with different position_ids for each batch element."""
+        attn = ALiBiAttention(embed_dim=D, num_heads=4)
+        x = torch.randn(2, 10, D)
+        # Different starting positions for each batch
+        position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                                     [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]])
+        out = attn(x, position_ids=position_ids)
+        assert out.shape == x.shape
+
+    def test_position_ids_cross_attention(self, D):
+        """Test position_ids with cross-attention (different Q and K lengths)."""
+        attn = ALiBiAttention(embed_dim=D, num_heads=4)
+        B = 2
+        q = torch.randn(B, 5, D)
+        kv = torch.randn(B, 15, D)
+        # Position IDs for both Q and K (they share the same position space)
+        position_ids = torch.arange(50, 50 + 15).unsqueeze(0).expand(B, -1)
+        out = attn(q, key=kv, value=kv, position_ids=position_ids)
+        assert out.shape == q.shape
+
+    def test_position_ids_single_token(self, D):
+        """Test with single token sequence and position_ids."""
+        attn = ALiBiAttention(embed_dim=D, num_heads=4)
+        x = torch.randn(2, 1, D)
+        position_ids = torch.tensor([[100], [200]])
+        out = attn(x, position_ids=position_ids)
+        assert out.shape == x.shape
+
+    def test_position_ids_large_offset(self, D):
+        """Test with very large position offset (e.g., 1e6)."""
+        attn = ALiBiAttention(embed_dim=D, num_heads=4)
+        x = torch.randn(2, 10, D)
+        # Large offset should still work (ALiBi uses absolute positions)
+        position_ids = torch.arange(1_000_000, 1_000_010).unsqueeze(0).expand(2, -1)
+        out = attn(x, position_ids=position_ids)
+        assert out.shape == x.shape
+        # Verify no NaN/Inf
+        assert torch.all(torch.isfinite(out))
 
 
 # ============================================================================
