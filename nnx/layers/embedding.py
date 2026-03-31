@@ -16,6 +16,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 
 # ---------------------------------------------------------------------------
@@ -331,11 +332,11 @@ class ALiBiEmbedding(nn.Module):
         # Get positions for queries and keys
         # position_ids: (B, T) representing absolute positions
         # We need relative distances between all query and key positions
-        q_pos = position_ids.unsqueeze(2)  # (B, T, 1)
-        k_pos = position_ids.unsqueeze(1)  # (B, 1, T)
+        q_pos = rearrange(position_ids, '... t -> ... t 1')
+        k_pos = rearrange(position_ids, '... t -> ... 1 t')
         dist = (q_pos - k_pos).abs()  # (B, T, T)
 
         # Apply slopes: (H, 1, 1) * (B, T, T) -> (B, H, T, T)
-        bias = -self.slopes.to(device)[None, :, None, None] * dist.unsqueeze(1).to(device)
+        bias = -self.slopes.to(device)[None, :, None, None] * rearrange(dist, '... t1 t2 -> ... 1 t1 t2').to(device)
 
         return bias  # (B, H, T, T)

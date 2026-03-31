@@ -29,6 +29,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from einops import rearrange
+
 
 class RWKVTimeMixing(nn.Module):
     """
@@ -260,10 +262,10 @@ class RWKV6TimeMixing(nn.Module):
 
         # Simple sequential WKV-6 (full CUDA kernel in the fla library)
         H, Dh = self.n_heads, self.head_dim
-        r_ = r.view(B, T, H, Dh)
-        k_ = k.view(B, T, H, Dh)
-        v_ = v.view(B, T, H, Dh)
-        w_ = w.view(B, T, H, Dh)
+        r_ = rearrange(r, '... t (h d) -> ... t h d', h=H, d=Dh)
+        k_ = rearrange(k, '... t (h d) -> ... t h d', h=H, d=Dh)
+        v_ = rearrange(v, '... t (h d) -> ... t h d', h=H, d=Dh)
+        w_ = rearrange(w, '... t (h d) -> ... t h d', h=H, d=Dh)
 
         out = torch.zeros_like(v_)
         state = torch.zeros(B, H, Dh, Dh, device=x.device, dtype=x.dtype)
@@ -276,6 +278,6 @@ class RWKV6TimeMixing(nn.Module):
             state = state * ww.unsqueeze(-1) + kk * vv
             out[:, t] = (state @ rr).squeeze(-1)  # (B,H,Dh)
 
-        out = out.view(B, T, D)
-        out = self.ln_x(out.view(B * T, D)).view(B, T, D)
+        out = rearrange(out, 'b t h d -> b t (h d)', h=H, d=Dh)
+        out = rearrange(self.ln_x(rearrange(out, 'b t d -> (b t) d')), '(b t) d -> b t d', b=B, t=T)
         return self.output(out * g)

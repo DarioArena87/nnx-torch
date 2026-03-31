@@ -44,6 +44,7 @@ requires-python = ">=3.10"
 # that users who only need SDPA (the default backend) do not have to install
 # large extras they will never use.
 dependencies = [
+    "einops>=0.8.2",
     "torch>=2.1.0",
 ]
 

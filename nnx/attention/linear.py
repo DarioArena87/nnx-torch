@@ -19,6 +19,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import warnings
+from einops import rearrange
 
 from .base import BaseAttention
 
@@ -135,8 +136,7 @@ class _FLABaseAttention(BaseAttention):
     
     def _split_heads(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
         """Split tensor into heads: (B, T, D) -> (B, H, T, Dh)"""
-        B, T, _ = x.shape
-        return x.view(B, T, self.num_heads, head_dim).transpose(1, 2)
+        return rearrange(x, '... t (h d) -> ... h t d', h=self.num_heads, d=head_dim)
     
     def forward(
         self,
@@ -267,19 +267,19 @@ class GLAAttention(_FLABaseAttention):
         
         # GLA expects gate g with shape (B, T, H, Dh) matching q and k
         B, Tq, _ = query.shape
-        g = torch.sigmoid(self.g_proj(query)).view(B, Tq, self.num_heads, self.head_dim)
+        g = rearrange(torch.sigmoid(self.g_proj(query)), '... t (h d) -> ... t h d', h=self.num_heads, d=self.head_dim)
         
         # Transpose q, k, v from head-first (B, H, T, D) to seq-first (B, T, H, D)
-        q_seq = q.transpose(1, 2).contiguous()
-        k_seq = k.transpose(1, 2).contiguous()
-        v_seq = v.transpose(1, 2).contiguous()
+        q_seq = rearrange(q, '... h t d -> ... t h d').contiguous()
+        k_seq = rearrange(k, '... h t d -> ... t h d').contiguous()
+        v_seq = rearrange(v, '... h t d -> ... t h d').contiguous()
         
         # Call kernel: chunk_gla(q, k, v, g) -> (out, latent_state)
         # Output shape: (B, T, H, Dv)
         out_seq, _ = self.kernel(q_seq, k_seq, v_seq, g)
         
         # Transpose back to head-first (B, H, T, Dv)
-        out = out_seq.transpose(1, 2).contiguous()
+        out = rearrange(out_seq, '... t h d -> ... h t d').contiguous()
         return out
 
 
@@ -361,20 +361,20 @@ class DeltaAttention(_FLABaseAttention):
         
         # DeltaNet expects beta with shape (B, H, T)
         B, Tq, _ = query.shape
-        # Project to (B, Tq, H) and transpose to (B, H, Tq)
-        beta = torch.sigmoid(self.g_proj(query)).transpose(1, 2).contiguous()
+        # Project to (B, Tq, H) and rearrange to (B, H, Tq)
+        beta = rearrange(torch.sigmoid(self.g_proj(query)), '... t h -> ... h t').contiguous()
         
         # Transpose q, k, v from head-first (B, H, T, D) to seq-first (B, T, H, D)
-        q_seq = q.transpose(1, 2).contiguous()
-        k_seq = k.transpose(1, 2).contiguous()
-        v_seq = v.transpose(1, 2).contiguous()
+        q_seq = rearrange(q, '... h t d -> ... t h d').contiguous()
+        k_seq = rearrange(k, '... h t d -> ... t h d').contiguous()
+        v_seq = rearrange(v, '... h t d -> ... t h d').contiguous()
         
         # Call kernel: chunk_delta_rule(q, k, v, beta) -> (out, latent_state)
         # head_first=False (default) because we passed seq-first tensors
         out_seq, _ = self.kernel(q_seq, k_seq, v_seq, beta)
         
         # Transpose back to head-first (B, H, T, Dv)
-        out = out_seq.transpose(1, 2).contiguous()
+        out = rearrange(out_seq, '... t h d -> ... h t d').contiguous()
         return out
 
 
@@ -450,16 +450,16 @@ class BasedAttention(_FLABaseAttention):
             )
         
         # Transpose q, k, v from head-first (B, H, T, D) to seq-first (B, T, H, D)
-        q_seq = q.transpose(1, 2).contiguous()
-        k_seq = k.transpose(1, 2).contiguous()
-        v_seq = v.transpose(1, 2).contiguous()
+        q_seq = rearrange(q, '... h t d -> ... t h d').contiguous()
+        k_seq = rearrange(k, '... h t d -> ... t h d').contiguous()
+        v_seq = rearrange(v, '... h t d -> ... t h d').contiguous()
         
         # parallel_based returns output with shape (B, T, H, Dv)
         # head_first=False (default)
         out_seq = self.kernel(q_seq, k_seq, v_seq)
         
         # Transpose back to head-first (B, H, T, Dv)
-        out = out_seq.transpose(1, 2).contiguous()
+        out = rearrange(out_seq, '... t h d -> ... h t d').contiguous()
         return out
 
 
@@ -535,16 +535,16 @@ class RetentionAttention(_FLABaseAttention):
             )
         
         # Transpose q, k, v from head-first (B, H, T, D) to seq-first (B, T, H, D)
-        q_seq = q.transpose(1, 2).contiguous()
-        k_seq = k.transpose(1, 2).contiguous()
-        v_seq = v.transpose(1, 2).contiguous()
+        q_seq = rearrange(q, '... h t d -> ... t h d').contiguous()
+        k_seq = rearrange(k, '... h t d -> ... t h d').contiguous()
+        v_seq = rearrange(v, '... h t d -> ... t h d').contiguous()
         
         # chunk_retention returns (out, latent_state) with out shape (B, T, H, Dv)
         # head_first=False (default)
         out_seq, _ = self.kernel(q_seq, k_seq, v_seq)
         
         # Transpose back to head-first (B, H, T, Dv)
-        out = out_seq.transpose(1, 2).contiguous()
+        out = rearrange(out_seq, '... t h d -> ... h t d').contiguous()
         return out
 
 

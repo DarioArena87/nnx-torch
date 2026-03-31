@@ -13,6 +13,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from einops import rearrange
 
 
 class BaseAttention(nn.Module, abc.ABC):
@@ -65,13 +66,11 @@ class BaseAttention(nn.Module, abc.ABC):
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         """(B, T, D) → (B, H, T, Dh)"""
-        B, T, _ = x.shape
-        return x.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        return rearrange(x, '... t (h d) -> ... h t d', h=self.num_heads)
 
     def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
         """(B, H, T, Dh) → (B, T, D)"""
-        B, H, T, Dh = x.shape
-        return x.transpose(1, 2).contiguous().view(B, T, H * Dh)
+        return rearrange(x, '... h t d -> ... t (h d)')
 
     # ------------------------------------------------------------------
     # Abstract interface

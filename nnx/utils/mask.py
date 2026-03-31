@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from typing import Optional
+from einops import rearrange
 
 
 def hf_to_additive(
@@ -39,7 +40,7 @@ def hf_to_additive(
     # 1 → 0.0, 0 → -inf
     additive = torch.zeros_like(mask, dtype=dtype)
     additive = additive.masked_fill(~mask, float("-inf"))
-    return additive[:, None, None, :]  # (B, 1, 1, T)
+    return rearrange(additive, '... t -> ... 1 1 t')  # (B, 1, 1, T)
 
 
 def hf_to_additive_2d(
@@ -95,5 +96,5 @@ def pad_mask_to_4d(mask: torch.Tensor) -> torch.Tensor:
     if mask.dim() == 2:
         return hf_to_additive(mask, dtype=torch.float32)
     if mask.dim() == 3:
-        return mask.unsqueeze(2)
+        return rearrange(mask, '... h t -> ... h 1 t')
     return mask
