@@ -13,7 +13,6 @@ from nnx.attention import (
     SDPAttention,
     RWKVTimeMixing,
     RWKV6TimeMixing,
-    LinearAttention,
     GLAAttention,
     DeltaAttention,
     BasedAttention,
@@ -993,45 +992,6 @@ class TestRetentionAttention:
         with pytest.raises(ValueError, match="does not support cross-attention with different query/key lengths"):
             attn(q, key=kv, value=kv)
 
-
-# ============================================================================
-# Backward compatibility: LinearAttention factory tests
-# ============================================================================
-
-class TestLinearAttentionFactory:
-    """Test the backward-compatible LinearAttention factory."""
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="LinearAttention requires CUDA")
-    @pytest.mark.parametrize("variant", ["gla", "delta", "based", "retention"])
-    def test_factory_creates_correct_impl(self, variant):
-        """Test that LinearAttention factory creates the correct implementation."""
-        attn = LinearAttention(embed_dim=128, num_heads=4, variant=variant).cuda()
-        assert attn.variant == variant
-        # Check that the implementation is of the correct type
-        impl = attn._impl
-        if variant == "gla":
-            assert isinstance(impl, GLAAttention)
-        elif variant == "delta":
-            assert isinstance(impl, DeltaAttention)
-        elif variant == "based":
-            assert isinstance(impl, BasedAttention)
-        elif variant == "retention":
-            assert isinstance(impl, RetentionAttention)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="LinearAttention requires CUDA")
-    def test_factory_default_is_gla(self):
-        """Test that default variant is 'gla'."""
-        attn = LinearAttention(embed_dim=128, num_heads=4).cuda()
-        assert attn.variant == "gla"
-        assert isinstance(attn._impl, GLAAttention)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="LinearAttention requires CUDA")
-    def test_factory_invalid_variant_raises(self):
-        """Test that invalid variant raises error."""
-        with pytest.raises(ValueError, match="Unknown linear attention variant"):
-            LinearAttention(embed_dim=128, num_heads=4, variant="invalid").cuda()
-
-
 # ============================================================================
 # build_attention factory tests
 # ============================================================================
@@ -1078,12 +1038,6 @@ class TestBuildAttentionFactory:
         """Test creating RetentionAttention via build_attention."""
         attn = build_attention("retention", embed_dim=128, num_heads=4)
         assert isinstance(attn, RetentionAttention)
-
-    def test_linear_backward_compat_via_factory(self):
-        """Test creating LinearAttention (backward compat) via build_attention."""
-        attn = build_attention("linear", embed_dim=128, num_heads=4, variant="gla")
-        assert isinstance(attn, LinearAttention)
-        assert attn.variant == "gla"
 
     def test_rope_with_custom_params(self):
         """Test factory with custom parameters."""

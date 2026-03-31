@@ -3,7 +3,6 @@ from typing import Optional, Literal
 from .base import BaseAttention
 from .flex import FlexAttention
 from .linear import (
-    LinearAttention,
     GLAAttention,
     DeltaAttention,
     BasedAttention,
@@ -31,10 +30,6 @@ def build_attention(
             return RWKVTimeMixing(embed_dim, head_size=head_dim, **kwargs)
         case "flex":
             return FlexAttention(embed_dim, num_heads, dropout, bias)
-        case "linear":
-            # Backward compatibility: use variant parameter if provided
-            variant = kwargs.pop("variant", "gla")
-            return LinearAttention(embed_dim, num_heads, head_dim=head_dim, variant=variant, **kwargs)
         case "gla":
             return GLAAttention(embed_dim, num_heads, dropout, bias, head_dim, **kwargs)
         case "delta":
