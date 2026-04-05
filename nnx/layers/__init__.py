@@ -1,7 +1,8 @@
-from .normalization import ScaleNorm, CosineNorm, AdaptiveRMSNorm
+from .normalization import RMSNorm, ScaleNorm, CosineNorm, AdaptiveRMSNorm
 from .feedforward import FFN, GatedFFN, MoEFFN
 from .embedding import (
     TokenEmbedding,
+    TiedEmbedding,
     SinusoidalPositional,
     LearnedPositional,
     RotaryEmbedding,

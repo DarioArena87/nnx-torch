@@ -54,8 +54,14 @@ class RoPEAttention(BaseAttention):
         base: float = 10000.0,
         max_len: int = 4096,
         head_dim: Optional[int] = None,
+        num_key_value_heads: Optional[int] = None,
+        use_cache: bool = False,
     ) -> None:
-        super().__init__(embed_dim, num_heads, dropout, bias, head_dim)
+        super().__init__(
+            embed_dim, num_heads, dropout, bias, head_dim,
+            num_key_value_heads=num_key_value_heads,
+            use_cache=use_cache,
+        )
 
         if self.head_dim % 2 != 0:
             raise ValueError(
@@ -72,6 +78,7 @@ class RoPEAttention(BaseAttention):
         v: torch.Tensor,
         attn_bias: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
+        is_causal: bool = False,
     ) -> torch.Tensor:
         # Sequence lengths
         Tq = q.shape[2]
@@ -104,4 +111,5 @@ class RoPEAttention(BaseAttention):
             v,
             attn_mask=attn_bias,
             dropout_p=self.dropout if self.training else 0.0,
+            is_causal=is_causal and attn_bias is None,
         )

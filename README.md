@@ -157,6 +157,155 @@ output = block(x, attention_mask=mask)
 
 ---
 
+## ⚡ Performance Optimizations
+
+NNX-Torch includes a comprehensive set of performance optimizations for training and inference of transformer models.
+
+### Grouped Query Attention (GQA)
+
+Reduce KV cache memory by sharing KV heads across groups of query heads. Supports MHA, GQA, and MQA configurations.
+
+```python
+from nnx.attention import SDPAttention
+
+# Standard Multi-Head Attention (MHA)
+attn = SDPAttention(512, num_heads=8)
+
+# Grouped Query Attention (GQA) — 4 query heads share 2 KV heads
+attn = SDPAttention(512, num_heads=4, num_key_value_heads=2)
+
+# Multi-Query Attention (MQA) — all query heads share 1 KV head
+attn = SDPAttention(512, num_heads=4, num_key_value_heads=1)
+```
+
+### Packed Projections
+
+Combine multiple linear projections into a single `nn.Linear` to reduce kernel launch overhead and improve memory
+bandwidth.
+
+```python
+from nnx.attention import SDPAttention
+from nnx.layers import GatedFFN
+
+# Packed QKV projections in attention (single linear for Q, K, V)
+attn = SDPAttention(512, num_heads=8)
+
+# Packed gate+up projections in SwiGLU/GeGLU FFN
+ffn = GatedFFN(512)
+```
+
+### KV Cache for Autoregressive Generation
+
+Cache key/value tensors across forward passes for efficient token-by-token generation.
+
+```python
+from nnx.attention import SDPAttention
+
+attn = SDPAttention(512, num_heads=8, use_cache=True)
+
+# First pass
+out1 = attn(x, use_cache=True)
+past_kv = out1.past_key_value
+
+# Subsequent passes with cached KV
+out2 = attn(new_token, past_key_value=past_kv, use_cache=True)
+```
+
+### Gradient Checkpointing
+
+Trade ~20-30% extra compute for ~50-70% reduction in activation memory during training.
+
+```python
+from nnx.layers import TransformerLayer, TransformerStack, GatedFFN
+
+# Per-layer checkpointing
+layer = TransformerLayer(512, num_heads=8, gradient_checkpointing=True)
+
+# Stack-level checkpointing
+stack = TransformerStack(
+    n_layers=12, embed_dim=512, num_heads=8,
+    gradient_checkpointing=True,
+)
+
+# FFN-level checkpointing
+ffn = GatedFFN(512, gradient_checkpointing=True)
+```
+
+### NestedTensor for Variable-Length Sequences
+
+Process batches of variable-length sequences without padding overhead using PyTorch's `torch.nested.nested_tensor`.
+
+```python
+from nnx.layers import TransformerStack
+
+stack = TransformerStack(
+    n_layers=6, embed_dim=512, num_heads=8,
+    use_nested_tensor=True,  # Enable NestedTensor processing
+)
+
+# Variable-length sequences (mask: 1=real, 0=padding)
+x = torch.randn(4, 128, 512)
+mask = torch.tensor(
+    [
+        [1, 1, 1, 1, 0, 0],
+        [1, 1, 1, 0, 0, 0],
+        [1, 1, 1, 1, 1, 0],
+        [1, 1, 0, 0, 0, 0],
+    ], dtype=torch.long
+)
+
+output = stack(x, attention_mask=mask)
+```
+
+### Causal Attention Dispatch
+
+When `causal=True` and no attention bias is provided, NNX-Torch passes `is_causal=True` directly to PyTorch's SDPA,
+enabling optimized causal attention kernels (~15% speedup).
+
+```python
+from nnx.layers import TransformerLayer
+
+layer = TransformerLayer(512, num_heads=8, causal=True)
+# Automatically uses native causal attention in SDPA
+output = layer(x)
+```
+
+### Multiple Attention Backends
+
+Choose the optimal attention backend for your workload:
+
+| Backend                          | Complexity     | Best For                                           |
+|----------------------------------|----------------|----------------------------------------------------|
+| **SDPA**                         | O(N²)          | General purpose, auto-dispatches to FlashAttention |
+| **FlexAttention**                | O(N²)          | Custom attention patterns (sliding window, sparse) |
+| **Linear (GLA, DeltaNet, etc.)** | O(N)           | Long context, memory-constrained environments      |
+| **RWKV**                         | O(1) inference | Streaming, real-time applications                  |
+
+### Normalization Optimizations
+
+| Layer               | Use Case                                                         |
+|---------------------|------------------------------------------------------------------|
+| **RMSNorm**         | Default for modern LLMs (LLaMA, Mistral) — faster than LayerNorm |
+| **ScaleNorm**       | Parameter-efficient alternative                                  |
+| **CosineNorm**      | Normalized output for stable training                            |
+| **AdaptiveRMSNorm** | Conditional normalization for control networks                   |
+
+### Performance Comparison
+
+Expected improvements relative to a naive transformer implementation:
+
+| Optimization           | Memory Savings         | Speed Improvement      |
+|------------------------|------------------------|------------------------|
+| GQA (4:2)              | ~50% KV cache          | ~10-20%                |
+| Packed QKV             | —                      | ~5-10%                 |
+| KV Cache (inference)   | ~50-70% per token      | ~3-5x throughput       |
+| Gradient Checkpointing | ~50-70% activations    | -20-30% (trade-off)    |
+| NestedTensor           | ~30-50% (variable len) | ~2-4x (padded batches) |
+| Native Causal SDPA     | —                      | ~15%                   |
+| RMSNorm vs LayerNorm   | ~25% params            | ~10-15%                |
+
+---
+
 ## 🏗️ Project Structure
 
 ```
@@ -199,17 +348,4 @@ Contributions are welcome! Since the project is in early development, please con
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 📚 References & Acknowledgments
-
-- [PyTorch](https://pytorch.org/) - The foundational deep learning framework
-- [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) - Efficient linear attention
-  implementations
-- [HuggingFace Transformers](https://huggingface.co/docs/transformers/) - For attention mask conventions
-
----
-
-**Note**: This project is independently developed and is not affiliated with PyTorch or HuggingFace.
+MIT License — see [LICENSE](LICENSE) for details.

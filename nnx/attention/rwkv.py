@@ -47,6 +47,10 @@ class RWKVTimeMixing(nn.Module):
         n_layers:   Total number of layers (used for decay init).
         head_size:  Head dimension for grouped WKV (RWKV-5+).
                     If None, defaults to a single-head WKV.
+        use_recurrent_kernel: If True and ``fast_linear_attention`` package
+            is available, use optimized CUDA kernels. Falls back to Python
+            loop when not available.
+        chunk_size: Size of chunks for chunked processing. Default: 64.
 
     Note on ``attention_mask``:
         The WKV recurrence processes the sequence left-to-right.
@@ -61,6 +65,8 @@ class RWKVTimeMixing(nn.Module):
         layer_id: int = 0,
         n_layers: int = 12,
         head_size: Optional[int] = None,
+        use_recurrent_kernel: bool = False,
+        chunk_size: int = 64,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -92,6 +98,72 @@ class RWKVTimeMixing(nn.Module):
         self.receptance = nn.Linear(embed_dim, embed_dim, bias=False)
         self.output = nn.Linear(embed_dim, embed_dim, bias=False)
         self.ln_x = nn.LayerNorm(embed_dim)
+        
+        # W1: FLA kernel integration
+        self.use_recurrent_kernel = use_recurrent_kernel
+        self.chunk_size = chunk_size
+        self._fla_kernel = None
+        
+        if use_recurrent_kernel:
+            self._try_import_fla_kernel()
+
+    def _try_import_fla_kernel(self) -> None:
+        """W1: Try to import FLA RWKV kernel, fall back gracefully."""
+        try:
+            from fla.ops.rwkv import rwkv4
+            self._fla_kernel = rwkv4
+        except ImportError:
+            # FLA not available, will use Python fallback
+            self._fla_kernel = None
+
+    def _wkv_chunked(
+        self,
+        w: torch.Tensor,
+        u: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        W1: Chunked WKV computation for better memory efficiency.
+        
+        Processes the sequence in chunks and accumulates state.
+        """
+        B, T, D = k.shape
+        chunk_size = self.chunk_size
+        out = torch.zeros_like(v)
+        
+        # Initialize state
+        aa = torch.zeros(B, D, device=k.device, dtype=k.dtype)
+        bb = torch.zeros(B, D, device=k.device, dtype=k.dtype)
+        pp = torch.full((B, D), -1e38, device=k.device, dtype=k.dtype)
+        
+        exp_w = torch.exp(-torch.exp(w))
+        
+        num_chunks = (T + chunk_size - 1) // chunk_size
+        
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * chunk_size
+            end = min(start + chunk_size, T)
+            
+            for t in range(start, end):
+                kt = k[:, t, :]
+                vt = v[:, t, :]
+                
+                qt = torch.maximum(pp, kt + u)
+                e1 = torch.exp(pp - qt)
+                e2 = torch.exp(kt + u - qt)
+                wkv = (e1 * aa + e2 * vt) / (e1 * bb + e2)
+                
+                pp_new = torch.maximum(pp + exp_w.log(), kt)
+                e1 = torch.exp(pp - pp_new)
+                e2 = torch.exp(kt - pp_new)
+                aa = e1 * aa + e2 * vt
+                bb = e1 * bb + e2
+                pp = pp_new
+                
+                out[:, t, :] = wkv
+        
+        return out
 
     def _wkv_pytorch(
         self,
@@ -164,7 +236,19 @@ class RWKVTimeMixing(nn.Module):
             k = k * pad
             v = v * pad
 
-        wkv = self._wkv_pytorch(self.time_decay, self.time_first, k, v)
+        # W1: Use FLA kernel if available, otherwise use Python implementation
+        if self.use_recurrent_kernel and self._fla_kernel is not None:
+            # FLA kernel expects (B, T, H, D) format
+            k_ = k.unsqueeze(2)  # (B, T, 1, D)
+            v_ = v.unsqueeze(2)  # (B, T, 1, D)
+            wkv = self._fla_kernel(k_, v_, self.time_decay, self.time_first)
+            wkv = wkv.squeeze(2)  # (B, T, D)
+        elif self.chunk_size > 0 and T > self.chunk_size:
+            # Use chunked Python implementation for long sequences
+            wkv = self._wkv_chunked(self.time_decay, self.time_first, k, v)
+        else:
+            wkv = self._wkv_pytorch(self.time_decay, self.time_first, k, v)
+        
         rwkv = r * self.ln_x(wkv)
         return self.output(rwkv)
 
@@ -183,6 +267,10 @@ class RWKV6TimeMixing(nn.Module):
         layer_id:   Index of this layer.
         n_layers:   Total number of layers.
         n_heads:    Number of WKV heads (RWKV-6 uses multi-head WKV).
+        use_recurrent_kernel: If True and ``fast_linear_attention`` package
+            is available, use optimized CUDA kernels. Falls back to Python
+            loop when not available.
+        chunk_size: Size of chunks for chunked processing. Default: 64.
     """
 
     def __init__(
@@ -191,6 +279,8 @@ class RWKV6TimeMixing(nn.Module):
         layer_id: int = 0,
         n_layers: int = 12,
         n_heads: int = 1,
+        use_recurrent_kernel: bool = False,
+        chunk_size: int = 64,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -225,6 +315,23 @@ class RWKV6TimeMixing(nn.Module):
         self.w_proj = nn.Linear(embed_dim, embed_dim, bias=False)  # per-token decay
         self.output = nn.Linear(embed_dim, embed_dim, bias=False)
         self.ln_x = nn.GroupNorm(n_heads, embed_dim, eps=64e-5)
+        
+        # W1: FLA kernel integration
+        self.use_recurrent_kernel = use_recurrent_kernel
+        self.chunk_size = chunk_size
+        self._fla_kernel = None
+        
+        if use_recurrent_kernel:
+            self._try_import_fla_kernel()
+
+    def _try_import_fla_kernel(self) -> None:
+        """W1: Try to import FLA RWKV6 kernel, fall back gracefully."""
+        try:
+            from fla.ops.rwkv6 import rwkv6
+            self._fla_kernel = rwkv6
+        except ImportError:
+            # FLA not available, will use Python fallback
+            self._fla_kernel = None
 
     def forward(
         self,
@@ -260,24 +367,38 @@ class RWKV6TimeMixing(nn.Module):
             pad = attention_mask.bool().unsqueeze(-1)
             k, v = k * pad, v * pad
 
-        # Simple sequential WKV-6 (full CUDA kernel in the fla library)
+        # W1: Use FLA kernel if available, otherwise use Python loop
         H, Dh = self.n_heads, self.head_dim
-        r_ = rearrange(r, '... t (h d) -> ... t h d', h=H, d=Dh)
-        k_ = rearrange(k, '... t (h d) -> ... t h d', h=H, d=Dh)
-        v_ = rearrange(v, '... t (h d) -> ... t h d', h=H, d=Dh)
-        w_ = rearrange(w, '... t (h d) -> ... t h d', h=H, d=Dh)
+        
+        if self.use_recurrent_kernel and self._fla_kernel is not None:
+            # FLA kernel expects (B, T, H, D) format
+            r_ = rearrange(r, '... t (h d) -> ... t h d', h=H, d=Dh)
+            k_ = rearrange(k, '... t (h d) -> ... t h d', h=H, d=Dh)
+            v_ = rearrange(v, '... t (h d) -> ... t h d', h=H, d=Dh)
+            w_ = rearrange(w, '... t (h d) -> ... t h d', h=H, d=Dh)
+            
+            # Call FLA RWKV6 kernel
+            out_seq = self._fla_kernel(r_, k_, v_, w_, self.time_decay)
+            out = rearrange(out_seq, 'b t h d -> b t (h d)', h=H, d=Dh)
+        else:
+            # Simple sequential WKV-6 (full CUDA kernel in the fla library)
+            r_ = rearrange(r, '... t (h d) -> ... t h d', h=H, d=Dh)
+            k_ = rearrange(k, '... t (h d) -> ... t h d', h=H, d=Dh)
+            v_ = rearrange(v, '... t (h d) -> ... t h d', h=H, d=Dh)
+            w_ = rearrange(w, '... t (h d) -> ... t h d', h=H, d=Dh)
 
-        out = torch.zeros_like(v_)
-        state = torch.zeros(B, H, Dh, Dh, device=x.device, dtype=x.dtype)
+            out = torch.zeros_like(v_)
+            state = torch.zeros(B, H, Dh, Dh, device=x.device, dtype=x.dtype)
 
-        for t in range(T):
-            kk = k_[:, t, :, :, None]  # (B,H,Dh,1)
-            vv = v_[:, t, :, None, :]  # (B,H,1,Dh)
-            rr = r_[:, t, :, :, None]  # (B,H,Dh,1)
-            ww = torch.exp(w_[:, t, :, :])  # (B,H,Dh) decay per dim
-            state = state * ww.unsqueeze(-1) + kk * vv
-            out[:, t] = (state @ rr).squeeze(-1)  # (B,H,Dh)
+            for t in range(T):
+                kk = k_[:, t, :, :, None]  # (B,H,Dh,1)
+                vv = v_[:, t, :, None, :]  # (B,H,1,Dh)
+                rr = r_[:, t, :, :, None]  # (B,H,Dh,1)
+                ww = torch.exp(w_[:, t, :, :])  # (B,H,Dh) decay per dim
+                state = state * ww.unsqueeze(-1) + kk * vv
+                out[:, t] = (state @ rr).squeeze(-1)  # (B,H,Dh)
 
-        out = rearrange(out, 'b t h d -> b t (h d)', h=H, d=Dh)
+            out = rearrange(out, 'b t h d -> b t (h d)', h=H, d=Dh)
+        
         out = rearrange(self.ln_x(rearrange(out, 'b t d -> (b t) d')), '(b t) d -> b t d', b=B, t=T)
         return self.output(out * g)

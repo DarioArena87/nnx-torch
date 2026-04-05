@@ -183,5 +183,74 @@ class TestNormalizationLayers:
         assert torch.all(out >= -1.0) and torch.all(out <= 1.0)
 
 
+class TestRMSNormFallback:
+    """Test suite for RMSNorm fallback implementation."""
+
+    @pytest.fixture
+    def B(self):
+        return 2
+
+    @pytest.fixture
+    def T(self):
+        return 10
+
+    @pytest.fixture
+    def D(self):
+        return 128
+
+    @pytest.fixture
+    def x(self, B, T, D):
+        return torch.randn(B, T, D)
+
+    def test_rmsnorm_forward(self, x, D):
+        """Test RMSNorm forward pass."""
+        from nnx.layers.normalization import RMSNorm
+        norm = RMSNorm(D)
+        out = norm(x)
+        assert out.shape == x.shape
+
+    def test_rmsnorm_gradient_computation(self, x, D):
+        """Test RMSNorm gradient computation."""
+        from nnx.layers.normalization import RMSNorm
+        norm = RMSNorm(D)
+        out = norm(x)
+        loss = out.sum()
+        loss.backward()
+        # Check that weight has gradients
+        assert norm.weight.grad is not None
+
+    def test_rmsnorm_formula(self, D):
+        """Verify behavior matches expected RMSNorm formula."""
+        from nnx.layers.normalization import RMSNorm
+        torch.manual_seed(42)
+        norm = RMSNorm(D)
+        norm.eval()
+        
+        x = torch.randn(2, 10, D)
+        with torch.no_grad():
+            out = norm(x)
+        
+        # Manually compute RMSNorm
+        rms = x.pow(2).mean(-1, keepdim=True).sqrt()
+        expected = x / (rms + 1e-6) * norm.weight
+        
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_rmsnorm_weight_shape(self, D):
+        """Test that RMSNorm has correct weight shape."""
+        from nnx.layers.normalization import RMSNorm
+        norm = RMSNorm(D)
+        assert norm.weight.shape == (D,)
+
+    def test_rmsnorm_eps(self, D):
+        """Test RMSNorm with different epsilon values."""
+        from nnx.layers.normalization import RMSNorm
+        norm = RMSNorm(D, eps=1e-5)
+        x = torch.randn(2, 10, D)
+        out = norm(x)
+        assert out.shape == x.shape
+        assert torch.all(torch.isfinite(out))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

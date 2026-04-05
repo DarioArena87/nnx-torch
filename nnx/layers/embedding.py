@@ -51,6 +51,76 @@ class TokenEmbedding(nn.Module):
         return self.embed(x) * self.scale
 
 
+class TiedEmbedding(nn.Module):
+    """
+    E1: Tied embedding layer that shares weights between input and output projections.
+
+    This is useful for language models where the input embedding matrix
+    and output projection (language model head) share the same weights,
+    reducing parameters by ``vocab_size × embed_dim``.
+
+    Args:
+        vocab_size:  Vocabulary size.
+        embedding_dim: Embedding dimensionality.
+        padding_idx: Padding token index (embedding is zeroed).
+
+    Example::
+
+        embedding = TiedEmbedding(vocab_size=32000, embedding_dim=768)
+        
+        # Encode token IDs to embeddings
+        hidden = embedding(input_ids)  # (B, T, D)
+        
+        # Decode hidden states to logits using transposed weights
+        logits = embedding.decode(hidden)  # (B, T, V)
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(vocab_size, embedding_dim))
+        self.padding_idx = padding_idx
+        
+        # Initialize weights
+        nn.init.normal_(self.weight, mean=0.0, std=1.0 / embedding_dim)
+        
+        if padding_idx is not None:
+            with torch.no_grad():
+                self.weight[padding_idx].zero_()
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Encode token IDs to embeddings.
+
+        Args:
+            input_ids: (B, T) token IDs.
+
+        Returns:
+            (B, T, D) embeddings.
+        """
+        return F.embedding(
+            input_ids,
+            self.weight,
+            padding_idx=self.padding_idx,
+        )
+
+    def decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Decode hidden states to logits using transposed weight matrix.
+
+        Args:
+            hidden_states: (B, T, D) hidden states.
+
+        Returns:
+            (B, T, V) logits.
+        """
+        return F.linear(hidden_states, self.weight)
+
+
 # ---------------------------------------------------------------------------
 # Sinusoidal positional encoding
 # ---------------------------------------------------------------------------
@@ -157,20 +227,24 @@ class RotaryEmbedding(nn.Module):
 
         # Pre-compute cos/sin cache
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
-        self.register_buffer("inv_freq", inv_freq)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._build_cache(max_len, dtype)
 
     def _build_cache(self, seq_len: int, dtype: torch.dtype) -> None:
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=torch.float32)
         freqs = torch.outer(t, self.inv_freq)  # (T, D/2)
         emb = torch.cat([freqs, freqs], dim=-1)  # (T, D)
-        self.register_buffer("cos_cached", emb.cos().to(dtype))
-        self.register_buffer("sin_cached", emb.sin().to(dtype))
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        """Split last dim in half, negate second half and swap."""
-        x1, x2 = x.chunk(2, dim=-1)
+        """Split last dim in half, negate second half and swap.
+        
+        Uses index slicing instead of chunk() for better torch.compile compatibility.
+        """
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
         return torch.cat([-x2, x1], dim=-1)
 
     def rotate_queries_keys(
@@ -180,7 +254,7 @@ class RotaryEmbedding(nn.Module):
         offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply RoPE to Q and K in-place equivalent.
+        Apply RoPE to Q and K using in-place operations where possible.
 
         Args:
             q: (B, H, T, head_dim) query tensor.
@@ -193,8 +267,16 @@ class RotaryEmbedding(nn.Module):
         T = q.shape[2]
         cos = self.cos_cached[offset : offset + T].unsqueeze(0).unsqueeze(0)
         sin = self.sin_cached[offset : offset + T].unsqueeze(0).unsqueeze(0)
-        q_rot = q * cos + self._rotate_half(q) * sin
-        k_rot = k * cos + self._rotate_half(k) * sin
+        
+        # Use in-place operations to reduce memory allocations
+        q_rot = q.clone()
+        q_rot.mul_(cos)
+        q_rot.add_(self._rotate_half(q) * sin)
+        
+        k_rot = k.clone()
+        k_rot.mul_(cos)
+        k_rot.add_(self._rotate_half(k) * sin)
+        
         return q_rot, k_rot
 
     def forward(
@@ -211,7 +293,7 @@ class RotaryEmbedding(nn.Module):
         position_ids: torch.Tensor, # (B, T) or (T,)
     ) -> torch.Tensor:
         """
-        Apply RoPE using explicit position indices.
+        Apply RoPE using explicit position indices with in-place operations.
 
         Supports chunked sequences where position_ids may be [2049, 2050, ...].
 
@@ -236,7 +318,12 @@ class RotaryEmbedding(nn.Module):
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
 
-        return x * cos + self._rotate_half(x) * sin
+        # Use in-place operations to reduce memory allocations
+        x_rot = x.clone()
+        x_rot.mul_(cos)
+        x_rot.add_(self._rotate_half(x) * sin)
+        
+        return x_rot
 
     def _extend_cache(self, seq_len: int) -> None:
         """Extend the cos/sin cache to accommodate longer sequences."""

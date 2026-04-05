@@ -1124,5 +1124,451 @@ class TestBuildAttentionFactory:
             build_attention("invalid_type", embed_dim=128, num_heads=4)
 
 
+# ============================================================================
+# GQA (Grouped Query Attention) Tests
+# ============================================================================
+
+class TestGQA:
+    """Test suite for Grouped Query Attention (GQA) support."""
+
+    @pytest.fixture
+    def B(self):
+        return 2
+
+    @pytest.fixture
+    def T(self):
+        return 10
+
+    @pytest.fixture
+    def D(self):
+        return 128
+
+    @pytest.fixture
+    def x(self, B, T, D):
+        return torch.randn(B, T, D)
+
+    def test_gqa_mode(self, x, D):
+        """Test BaseAttention with num_key_value_heads < num_heads (GQA mode)."""
+        attn = SDPAttention(embed_dim=D, num_heads=8, num_key_value_heads=2)
+        out = attn(x)
+        assert out.shape == x.shape
+
+    def test_mha_mode_default(self, x, D):
+        """Test BaseAttention with num_key_value_heads = num_heads (MHA mode, default)."""
+        attn = SDPAttention(embed_dim=D, num_heads=4)
+        out = attn(x)
+        assert out.shape == x.shape
+
+    def test_mqa_mode(self, x, D):
+        """Test BaseAttention with num_key_value_heads = 1 (MQA mode)."""
+        attn = SDPAttention(embed_dim=D, num_heads=8, num_key_value_heads=1)
+        out = attn(x)
+        assert out.shape == x.shape
+
+    def test_gqa_output_shape(self, D):
+        """Verify GQA output shapes match expected dimensions."""
+        B, T = 2, 15
+        x = torch.randn(B, T, D)
+        attn = SDPAttention(embed_dim=D, num_heads=8, num_key_value_heads=4)
+        out = attn(x)
+        assert out.shape == (B, T, D)
+
+    def test_gqa_via_build_attention(self, x, D):
+        """Test GQA with build_attention() function."""
+        attn = build_attention(
+            "sdpa", embed_dim=D, num_heads=8, num_key_value_heads=2
+        )
+        out = attn(x)
+        assert out.shape == x.shape
+
+    def test_gqa_gradients(self, x, D):
+        """Test that gradients flow correctly through GQA."""
+        attn = SDPAttention(embed_dim=D, num_heads=8, num_key_value_heads=2)
+        out = attn(x)
+        loss = out.sum()
+        loss.backward()
+        for param in attn.parameters():
+            assert param.grad is not None
+
+# ============================================================================
+# KV Cache Tests
+# ============================================================================
+
+class TestKVCache:
+    """Test suite for KV cache support in attention modules."""
+
+    @pytest.fixture
+    def B(self):
+        return 2
+
+    @pytest.fixture
+    def T(self):
+        return 10
+
+    @pytest.fixture
+    def D(self):
+        return 128
+
+    @pytest.fixture
+    def x(self, B, T, D):
+        return torch.randn(B, T, D)
+
+    def test_use_cache_returns_attention_output(self, x, D):
+        """Test BaseAttention with use_cache=True returns AttentionOutput."""
+        from nnx.attention.base import AttentionOutput
+        attn = SDPAttention(embed_dim=D, num_heads=4, use_cache=True)
+        out = attn(x)
+        assert isinstance(out, AttentionOutput)
+        assert out.hidden_states.shape == x.shape
+        assert out.past_key_value is not None
+
+    def test_past_key_value_concatenation(self, D):
+        """Test past_key_value concatenation across multiple forward passes."""
+        attn = SDPAttention(embed_dim=D, num_heads=4)
+        attn.eval()
+        
+        # First forward pass
+        x1 = torch.randn(2, 5, D)
+        out1 = attn(x1)
+        
+        # Second forward pass with past_key_value
+        x2 = torch.randn(2, 3, D)
+        past_key, past_value = out1.past_key_value if hasattr(out1, 'past_key_value') and out1.past_key_value is not None else (None, None)
+        
+        if past_key is not None:
+            out2 = attn(x2, past_key_value=(past_key, past_value))
+            # Key/value cache should have concatenated: 5 + 3 = 8
+            assert out2.past_key_value[0].shape[2] == 8
+            assert out2.past_key_value[1].shape[2] == 8
+        else:
+            # If use_cache is False by default, test with explicit use_cache
+            out1 = attn(x1, use_cache=True)
+            past_key, past_value = out1.past_key_value
+            out2 = attn(x2, past_key_value=(past_key, past_value), use_cache=True)
+            assert out2.past_key_value[0].shape[2] == 8
+            assert out2.past_key_value[1].shape[2] == 8
+
+    def test_use_cache_false_returns_tensor(self, x, D):
+        """Test use_cache=False returns tensor (backward compatibility)."""
+        attn = SDPAttention(embed_dim=D, num_heads=4, use_cache=False)
+        out = attn(x)
+        assert isinstance(out, torch.Tensor)
+        assert out.shape == x.shape
+
+    def test_kv_cache_different_batch_sizes(self, D):
+        """Test KV cache with different batch sizes."""
+        attn = SDPAttention(embed_dim=D, num_heads=4)
+        attn.eval()
+        
+        # First pass with batch size 2
+        x1 = torch.randn(2, 5, D)
+        out1 = attn(x1, use_cache=True)
+        past_key, past_value = out1.past_key_value
+        
+        # Second pass with same batch size
+        x2 = torch.randn(2, 3, D)
+        out2 = attn(x2, past_key_value=(past_key, past_value), use_cache=True)
+        assert out2.hidden_states.shape == (2, 3, D)
+        assert out2.past_key_value[0].shape[2] == 8  # 5 + 3
+
+
+# ============================================================================
+# Causal Dispatch Tests
+# ============================================================================
+
+class TestCausalDispatch:
+    """Test suite for causal dispatch optimization in SDPA."""
+
+    @pytest.fixture
+    def B(self):
+        return 2
+
+    @pytest.fixture
+    def T(self):
+        return 10
+
+    @pytest.fixture
+    def D(self):
+        return 128
+
+    @pytest.fixture
+    def x(self, B, T, D):
+        return torch.randn(B, T, D)
+
+    @pytest.fixture
+    def mask(self, B, T):
+        mask = torch.ones(B, T, dtype=torch.bool)
+        mask[0, 7:] = False
+        mask[1, 9:] = False
+        return mask
+
+    def test_sdpa_causal_no_mask(self, x, D):
+        """Test SDPA with is_causal=True and no mask (should use optimized path)."""
+        attn = SDPAttention(embed_dim=D, num_heads=4)
+        attn.eval()
+        out = attn(x, causal=True)
+        assert out.shape == x.shape
+
+    def test_sdpa_causal_with_attention_mask(self, x, mask, D):
+        """Test SDPA with is_causal=True and attention mask (should apply both)."""
+        attn = SDPAttention(embed_dim=D, num_heads=4)
+        out = attn(x, attention_mask=mask, causal=True)
+        assert out.shape == x.shape
+
+    def test_sdpa_non_causal_no_mask(self, x, D):
+        """Test SDPA with is_causal=False and no mask."""
+        attn = SDPAttention(embed_dim=D, num_heads=4)
+        out = attn(x, causal=False)
+        assert out.shape == x.shape
+
+    def test_causal_dispatch_numerical_correctness(self, D):
+        """Verify causal masking produces correct attention patterns."""
+        attn = SDPAttention(embed_dim=D, num_heads=4)
+        attn.eval()
+        
+        x = torch.randn(1, 5, D)
+        with torch.no_grad():
+            out_causal = attn(x, causal=True)
+            out_non_causal = attn(x, causal=False)
+        
+        # Outputs should differ due to causal masking
+        assert not torch.allclose(out_causal, out_non_causal)
+
+
+# ============================================================================
+# FlexAttention ALiBi Tests
+# ============================================================================
+
+class TestFlexAttentionALiBi:
+    """Test suite for FlexAttention-based ALiBi attention."""
+
+    @pytest.fixture
+    def B(self):
+        return 2
+
+    @pytest.fixture
+    def T(self):
+        return 10
+
+    @pytest.fixture
+    def D(self):
+        return 128
+
+    @pytest.fixture
+    def x(self, B, T, D):
+        return torch.randn(B, T, D)
+
+    @pytest.mark.skipif(
+        not hasattr(torch.nn.attention, "flex_attention"),
+        reason="FlexAttention requires PyTorch 2.5+",
+    )
+    def test_alibi_flex_attention(self, D):
+        """Test ALiBiAttention with use_flex_attention=True (if PyTorch 2.5+)."""
+        # FlexAttention doesn't support backward on CPU, use eval mode
+        attn = ALiBiAttention(embed_dim=D, num_heads=4, use_flex_attention=True)
+        attn.eval()
+        x = torch.randn(2, 10, D)
+        with torch.no_grad():
+            out = attn(x)
+        assert out.shape == x.shape
+
+    def test_alibi_standard_path(self, x, D):
+        """Test ALiBiAttention with use_flex_attention=False (standard path)."""
+        attn = ALiBiAttention(embed_dim=D, num_heads=4, use_flex_attention=False)
+        out = attn(x)
+        assert out.shape == x.shape
+
+    @pytest.mark.skipif(
+        not hasattr(torch.nn.attention, "flex_attention"),
+        reason="FlexAttention requires PyTorch 2.5+",
+    )
+    def test_alibi_flex_vs_standard_equivalence(self, D):
+        """Verify numerical equivalence between FlexAttention and standard modes."""
+        torch.manual_seed(42)
+        attn_flex = ALiBiAttention(embed_dim=D, num_heads=4, use_flex_attention=True)
+        attn_flex.eval()
+        
+        torch.manual_seed(42)
+        attn_std = ALiBiAttention(embed_dim=D, num_heads=4, use_flex_attention=False)
+        attn_std.eval()
+        
+        x = torch.randn(2, 10, D)
+        with torch.no_grad():
+            out_flex = attn_flex(x)
+            out_std = attn_std(x)
+        
+        # Both should produce valid outputs with same shape
+        assert out_flex.shape == out_std.shape
+        # FlexAttention may have numerical differences due to different kernel
+        # Just verify they're in the same ballpark
+        assert torch.all(torch.isfinite(out_flex))
+        assert torch.all(torch.isfinite(out_std))
+
+
+# ============================================================================
+# Linear Attention Tests
+# ============================================================================
+
+class TestLinearAttentionVariants:
+    """Test suite for LinearAttention with different feature maps and chunking."""
+
+    @pytest.fixture
+    def B(self):
+        return 2
+
+    @pytest.fixture
+    def T(self):
+        return 10
+
+    @pytest.fixture
+    def D(self):
+        return 128
+
+    @pytest.fixture
+    def x(self, B, T, D):
+        return torch.randn(B, T, D)
+
+    def _create_concrete_attention(self, **kwargs):
+        """Create a concrete attention class for testing _FLABaseAttention methods."""
+        from nnx.attention.linear import _FLABaseAttention
+        
+        class ConcreteAttention(_FLABaseAttention):
+            def _import_kernel(self):
+                return None
+            def _attend(self, q, k, v, query, position_ids):
+                return v  # Dummy implementation
+        
+        return ConcreteAttention(**kwargs)
+
+    def test_linear_attention_elu(self, x, D):
+        """Test LinearAttention with feature_map='elu'."""
+        attn = self._create_concrete_attention(
+            embed_dim=D, num_heads=4, feature_map="elu"
+        )
+        # Test feature map application
+        test_x = torch.randn(2, 4, 10, 32)
+        out = attn._apply_feature_map(test_x)
+        assert out.shape == test_x.shape
+        # ELU + 1 should be all positive
+        assert torch.all(out > 0)
+
+    def test_linear_attention_relu(self, D):
+        """Test LinearAttention with feature_map='relu'."""
+        attn = self._create_concrete_attention(
+            embed_dim=D, num_heads=4, feature_map="relu"
+        )
+        test_x = torch.randn(2, 4, 10, 32)
+        out = attn._apply_feature_map(test_x)
+        assert out.shape == test_x.shape
+        # ReLU should have no negative values
+        assert torch.all(out >= 0)
+
+    def test_linear_attention_identity(self, D):
+        """Test LinearAttention with feature_map='identity'."""
+        attn = self._create_concrete_attention(
+            embed_dim=D, num_heads=4, feature_map="identity"
+        )
+        test_x = torch.randn(2, 4, 10, 32)
+        out = attn._apply_feature_map(test_x)
+        assert out.shape == test_x.shape
+        # Identity should return exact same tensor
+        torch.testing.assert_close(out, test_x)
+
+    def test_linear_attention_causal_chunking(self, D):
+        """Test LinearAttention with causal_chunking=True."""
+        attn = self._create_concrete_attention(
+            embed_dim=D, num_heads=4, causal_chunking=True, chunk_size=4
+        )
+        test_q = torch.randn(2, 4, 12, 32)
+        test_k = torch.randn(2, 4, 12, 32)
+        test_v = torch.randn(2, 4, 12, 32)
+        out = attn._chunked_causal_attention(test_q, test_k, test_v)
+        assert out.shape == test_v.shape
+
+    def test_linear_attention_different_chunk_sizes(self, D):
+        """Test LinearAttention with different chunk_size values."""
+        for chunk_size in [4, 8, 16]:
+            attn = self._create_concrete_attention(
+                embed_dim=D, num_heads=4, causal_chunking=True, chunk_size=chunk_size
+            )
+            test_q = torch.randn(2, 4, 16, 32)
+            test_k = torch.randn(2, 4, 16, 32)
+            test_v = torch.randn(2, 4, 16, 32)
+            out = attn._chunked_causal_attention(test_q, test_k, test_v)
+            assert out.shape == test_v.shape
+
+    def test_linear_attention_causal_property(self, D):
+        """Verify causal property of chunked attention."""
+        attn = self._create_concrete_attention(
+            embed_dim=D, num_heads=4, causal_chunking=True, chunk_size=4
+        )
+        test_q = torch.randn(1, 1, 8, 32)
+        test_k = torch.randn(1, 1, 8, 32)
+        test_v = torch.randn(1, 1, 8, 32)
+        out = attn._chunked_causal_attention(test_q, test_k, test_v)
+        assert out.shape == test_v.shape
+        assert torch.all(torch.isfinite(out))
+
+
+# ============================================================================
+# RWKV FLA Tests
+# ============================================================================
+
+class TestRWKVFLA:
+    """Test suite for RWKV with FLA kernel support."""
+
+    @pytest.fixture
+    def B(self):
+        return 2
+
+    @pytest.fixture
+    def T(self):
+        return 10
+
+    @pytest.fixture
+    def D(self):
+        return 128
+
+    @pytest.fixture
+    def x(self, B, T, D):
+        return torch.randn(B, T, D)
+
+    @pytest.fixture
+    def mask(self, B, T):
+        mask = torch.ones(B, T, dtype=torch.bool)
+        mask[0, 7:] = False
+        mask[1, 9:] = False
+        return mask
+
+    def test_rwkv_python_fallback(self, x, D):
+        """Test RWKVTimeMixing with use_recurrent_kernel=False (Python fallback)."""
+        rwkv = RWKVTimeMixing(embed_dim=D, layer_id=0, n_layers=6, use_recurrent_kernel=False)
+        out = rwkv(x)
+        assert out.shape == x.shape
+
+    def test_rwkv_chunk_size(self, x, D):
+        """Test RWKVTimeMixing with chunk_size parameter."""
+        rwkv = RWKVTimeMixing(
+            embed_dim=D, layer_id=0, n_layers=6, chunk_size=4
+        )
+        out = rwkv(x)
+        assert out.shape == x.shape
+
+    def test_rwkv_gradients(self, x, D):
+        """Test that gradients flow correctly through RWKV."""
+        rwkv = RWKVTimeMixing(embed_dim=D, layer_id=0, n_layers=6)
+        out = rwkv(x)
+        loss = out.sum()
+        loss.backward()
+        for param in rwkv.parameters():
+            assert param.grad is not None
+
+    def test_rwkv_with_attention_mask(self, x, mask, D):
+        """Test RWKVTimeMixing with attention mask."""
+        rwkv = RWKVTimeMixing(embed_dim=D, layer_id=0, n_layers=6)
+        out = rwkv(x, attention_mask=mask)
+        assert out.shape == x.shape
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

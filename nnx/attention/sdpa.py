@@ -46,13 +46,17 @@ class SDPAttention(BaseAttention):
         v: torch.Tensor,
         attn_bias: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
+        is_causal: bool = False,
     ) -> torch.Tensor:
-        # torch.nn.functional.scaled_dot_product_attention accepts an
-        # *additive* attn_mask (identical to our convention).
+        # S1: Causal dispatch — when is_causal=True and no attn_bias,
+        # pass is_causal=True to SDPA for optimized causal attention.
+        use_native_causal = is_causal and attn_bias is None
+
         return F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=attn_bias,
+            attn_mask=attn_bias if not use_native_causal else None,
             dropout_p=self.dropout if self.training else 0.0,
+            is_causal=use_native_causal,
         )

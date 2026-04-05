@@ -1,6 +1,6 @@
 from typing import Optional, Literal
 
-from .base import BaseAttention
+from .base import BaseAttention, AttentionOutput
 from .flex import FlexAttention
 from .linear import (
     GLAAttention,
@@ -21,11 +21,13 @@ def build_attention(
     dropout: float = 0.0,
     bias: bool = True,
     head_dim: Optional[int] = None,
+    num_key_value_heads: Optional[int] = None,
+    use_cache: bool = False,
     **kwargs,
 ):
     match attn_type:
         case "sdpa":
-            return SDPAttention(embed_dim, num_heads, dropout, bias)
+            return SDPAttention(embed_dim, num_heads, dropout, bias, head_dim, num_key_value_heads=num_key_value_heads, use_cache=use_cache)
         case "rwkv":
             return RWKVTimeMixing(embed_dim, head_size=head_dim, **kwargs)
         case "flex":

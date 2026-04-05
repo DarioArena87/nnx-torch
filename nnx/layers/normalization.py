@@ -19,6 +19,38 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Detect native RMSNorm availability (PyTorch 2.4+)
+_HAS_NATIVE_RMS_NORM = hasattr(F, "rms_norm")
+
+
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (Zhang & Sennrich, 2019).
+
+    Uses PyTorch's native ``torch.nn.functional.rms_norm`` when available
+    (PyTorch 2.4+), otherwise falls back to a manual implementation.
+
+    Args:
+        dim:  Feature dimensionality.
+        eps:  Numerical stability epsilon.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _manual_rms_norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Manual RMSNorm fallback for PyTorch < 2.4."""
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+        return self.weight * x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _HAS_NATIVE_RMS_NORM:
+            return F.rms_norm(x, normalized_shape=(x.size(-1),), weight=self.weight, eps=self.eps)
+        return self._manual_rms_norm(x)
+
 
 class ScaleNorm(nn.Module):
     """

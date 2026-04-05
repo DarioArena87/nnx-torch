@@ -18,6 +18,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import warnings
 from einops import rearrange
 
@@ -98,6 +99,13 @@ class _FLABaseAttention(BaseAttention):
     Note: Linear attention is inherently causal (uses recurrence), so
     the causal parameter is ignored — the recurrence always processes
     left-to-right.
+    
+    Args:
+        feature_map: Feature map to use for linear attention.
+            Supported: "elu" (default), "relu", "identity".
+        causal_chunking: If True, process sequences in chunks to reduce
+            memory for long sequences. Only used when FLA kernel is unavailable.
+        chunk_size: Size of chunks for causal_chunking. Default: 64.
     """
     
     def __init__(
@@ -109,12 +117,18 @@ class _FLABaseAttention(BaseAttention):
         head_dim: Optional[int] = None,
         expand_k: float = 1.0,
         expand_v: float = 1.0,
+        feature_map: str = "elu",
+        causal_chunking: bool = False,
+        chunk_size: int = 64,
         **kwargs,
     ) -> None:
         # Validate CUDA availability early
         assert torch.cuda.is_available(), f"{self.__class__.__name__} requires CUDA"
         
         super().__init__(embed_dim, num_heads, dropout, bias, head_dim)
+        
+        # Remove unused kv_proj from BaseAttention (we use separate k_proj/v_proj)
+        del self.kv_proj
         
         # Asymmetric projection dimensions
         self._k_dim = int(self.head_dim * expand_k)
@@ -133,10 +147,116 @@ class _FLABaseAttention(BaseAttention):
         
         # Initialize kernel (to be done in subclass)
         self._kernel = None
+        
+        # L1: Feature map and chunking parameters
+        self.feature_map = feature_map
+        self.causal_chunking = causal_chunking
+        self.chunk_size = chunk_size
     
     def _split_heads(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
         """Split tensor into heads: (B, T, D) -> (B, H, T, Dh)"""
         return rearrange(x, '... t (h d) -> ... h t d', h=self.num_heads, d=head_dim)
+    
+    def _apply_feature_map(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        L1: Apply feature map transformation for linear attention.
+        
+        Uses torch.nn.functional operations for efficient computation.
+        """
+        if self.feature_map == "elu":
+            return F.elu(x) + 1
+        elif self.feature_map == "relu":
+            return F.relu(x)
+        elif self.feature_map == "identity":
+            return x
+        else:
+            raise ValueError(f"Unsupported feature_map: {self.feature_map!r}. Supported: 'elu', 'relu', 'identity'")
+    
+    def _linear_attention_einsum(
+        self,
+        q: torch.Tensor,  # (B, H, T, D)
+        k: torch.Tensor,  # (B, H, T, D)
+        v: torch.Tensor,  # (B, H, T, Dv)
+    ) -> torch.Tensor:
+        """
+        L1: Efficient linear attention using torch.einsum.
+        
+        Computes: softmax(Q) @ (softmax(K)^T @ V)
+        Using associative property: (Q @ K^T) @ V = Q @ (K^T @ V)
+        This reduces complexity from O(T²D) to O(TD²).
+        """
+        # Apply feature map
+        q_feat = self._apply_feature_map(q)
+        k_feat = self._apply_feature_map(k)
+        
+        # L1: Use torch.einsum for efficient batch matrix operations
+        # Compute KV: (B, H, D, Dv) = einsum('bhnd,bhne->bhde', k, v)
+        kv = torch.einsum("bhnd,bhne->bhde", k_feat, v)
+        
+        # Compute output: (B, H, N, Dv) = einsum('bhnd,bhde->bhne', q, kv)
+        out = torch.einsum("bhnd,bhde->bhne", q_feat, kv)
+        
+        # Normalize by the sum of keys (for numerical stability)
+        z = torch.einsum("bhnd,bhd->bhn", q_feat, k_feat.sum(dim=2))
+        out = out / z.unsqueeze(-1).clamp(min=1e-6)
+        
+        return out
+    
+    def _chunked_causal_attention(
+        self,
+        q: torch.Tensor,  # (B, H, T, D)
+        k: torch.Tensor,  # (B, H, T, D)
+        v: torch.Tensor,  # (B, H, T, Dv)
+    ) -> torch.Tensor:
+        """
+        L1: Process sequences in chunks to reduce memory for long sequences.
+        
+        When causal_chunking is True, process the sequence in chunks of size
+        chunk_size, accumulating the KV state across chunks.
+        """
+        B, H, T, D = q.shape
+        Dv = v.shape[-1]
+        chunk_size = self.chunk_size
+        
+        # Initialize output and KV state
+        out = torch.zeros(B, H, T, Dv, device=q.device, dtype=q.dtype)
+        kv_state = torch.zeros(B, H, D, Dv, device=q.device, dtype=q.dtype)
+        
+        # Process in chunks
+        num_chunks = (T + chunk_size - 1) // chunk_size
+        
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = min(start + chunk_size, T)
+            
+            q_chunk = q[:, :, start:end, :]
+            k_chunk = k[:, :, start:end, :]
+            v_chunk = v[:, :, start:end, :]
+            
+            # Apply feature map
+            q_feat = self._apply_feature_map(q_chunk)
+            k_feat = self._apply_feature_map(k_chunk)
+            
+            # Compute output for this chunk using accumulated KV state
+            # out_chunk = q_chunk @ kv_state
+            out_chunk = torch.einsum("bhnd,bhde->bhne", q_feat, kv_state)
+            
+            # Add intra-chunk contribution
+            kv_chunk = torch.einsum("bhnd,bhne->bhde", k_feat, v_chunk)
+            out_chunk += torch.einsum("bhnd,bhde->bhne", q_feat, kv_chunk)
+            
+            # Normalize
+            z_state = torch.einsum("bhnd,bhd->bhn", q_feat, k_feat.sum(dim=2))
+            z_chunk = torch.einsum("bhnd,bhd->bhn", q_feat, k_chunk.sum(dim=2))
+            z_total = z_state + z_chunk
+            out_chunk = out_chunk / z_total.unsqueeze(-1).clamp(min=1e-6)
+            
+            out[:, :, start:end, :] = out_chunk
+            
+            # Update KV state for next chunk
+            kv_state = kv_state + kv_chunk
+        
+        return out
     
     def forward(
         self,

@@ -15,8 +15,61 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from collections import OrderedDict
 from typing import Optional
 from einops import rearrange
+
+# ------------------------------------------------------------------
+# Mask caching (M1 optimization)
+# ------------------------------------------------------------------
+
+_mask_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+_MAX_MASK_CACHE_SIZE = 64
+
+
+def _make_cache_key(size: int, device: torch.device, dtype: torch.dtype) -> str:
+    """Create a unique cache key for a mask configuration."""
+    return f"{size}_{device}_{dtype}"
+
+
+def get_cached_causal_mask(
+    seq_len: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Retrieve or create a causal mask, caching it for future use.
+
+    Args:
+        seq_len: Sequence length (T).
+        device: Target device for the mask tensor.
+        dtype: Target dtype for the mask tensor.
+
+    Returns:
+        (1, 1, T, T) additive causal bias tensor.
+    """
+    key = _make_cache_key(seq_len, device, dtype)
+    if key in _mask_cache:
+        return _mask_cache[key]
+
+    # Build the mask
+    mask = torch.triu(
+        torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
+        diagonal=1,
+    )
+    result = mask[None, None, :, :]  # (1, 1, T, T)
+
+    # Evict oldest entries if cache is full
+    while len(_mask_cache) >= _MAX_MASK_CACHE_SIZE:
+        _mask_cache.popitem(last=False)
+
+    _mask_cache[key] = result
+    return result
+
+
+def clear_mask_cache() -> None:
+    """Clear all cached attention masks."""
+    _mask_cache.clear()
 
 
 def hf_to_additive(
@@ -66,12 +119,10 @@ def make_causal_mask(
     """
     Standard upper-triangular causal mask of shape (1, 1, T, T).
     0.0 on and below the diagonal, -inf above.
+
+    Uses the internal cache to avoid recreating masks for common sizes.
     """
-    mask = torch.triu(
-        torch.full((seq_len, seq_len), float("-inf"), device=device, dtype=dtype),
-        diagonal=1,
-    )
-    return mask[None, None, :, :]  # (1, 1, T, T)
+    return get_cached_causal_mask(seq_len, device, dtype)
 
 
 def combine_masks(*masks: Optional[torch.Tensor]) -> Optional[torch.Tensor]:

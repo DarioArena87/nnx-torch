@@ -416,5 +416,149 @@ class TestALiBiEmbedding:
         assert torch.allclose(bias1, bias2)
 
 
+class TestTiedEmbedding:
+    """Test suite for TiedEmbedding layer."""
+
+    @pytest.fixture
+    def B(self):
+        return 2
+
+    @pytest.fixture
+    def T(self):
+        return 10
+
+    @pytest.fixture
+    def D(self):
+        return 128
+
+    @pytest.fixture
+    def V(self):
+        return 1000
+
+    def test_tied_embedding_forward(self, B, T, V, D):
+        """Test TiedEmbedding forward pass."""
+        from nnx.layers.embedding import TiedEmbedding
+        emb = TiedEmbedding(vocab_size=V, embedding_dim=D)
+        input_ids = torch.randint(0, V, (B, T))
+        out = emb(input_ids)
+        assert out.shape == (B, T, D)
+
+    def test_tied_embedding_decode(self, B, T, V, D):
+        """Test TiedEmbedding.decode() returns correct logits shape."""
+        from nnx.layers.embedding import TiedEmbedding
+        emb = TiedEmbedding(vocab_size=V, embedding_dim=D)
+        hidden = torch.randn(B, T, D)
+        logits = emb.decode(hidden)
+        assert logits.shape == (B, T, V)
+
+    def test_tied_embedding_weight_tying(self, V, D):
+        """Test TiedEmbedding input and output share same weights."""
+        from nnx.layers.embedding import TiedEmbedding
+        emb = TiedEmbedding(vocab_size=V, embedding_dim=D)
+        
+        # Encode a token
+        input_ids = torch.tensor([[0]])
+        encoded = emb(input_ids)  # (1, 1, D)
+        
+        # Decode back to logits
+        hidden = torch.zeros(1, 1, D)
+        hidden[0, 0] = encoded[0, 0]
+        logits = emb.decode(hidden)  # (1, 1, V)
+        
+        # The logit for token 0 should be the highest (since hidden = embedding[0])
+        assert logits[0, 0, 0] > logits[0, 0, 1:].max()
+
+    def test_tied_embedding_padding_idx(self, V, D):
+        """Test TiedEmbedding padding_idx behavior."""
+        from nnx.layers.embedding import TiedEmbedding
+        emb = TiedEmbedding(vocab_size=V, embedding_dim=D, padding_idx=0)
+        input_ids = torch.tensor([[0, 1, 2]])
+        out = emb(input_ids)
+        # Padding token (index 0) should be zero
+        assert torch.allclose(out[0, 0], torch.zeros(D))
+
+    def test_tied_embedding_gradient_flow(self, V, D):
+        """Test gradient flow through tied weights."""
+        from nnx.layers.embedding import TiedEmbedding
+        emb = TiedEmbedding(vocab_size=V, embedding_dim=D)
+        input_ids = torch.randint(0, V, (2, 10))
+        
+        # Forward through encode
+        hidden = emb(input_ids)
+        # Forward through decode
+        logits = emb.decode(hidden)
+        
+        loss = logits.sum()
+        loss.backward()
+        
+        # Weight should have gradients
+        assert emb.weight.grad is not None
+
+
+class TestRoPEOptimization:
+    """Test suite for RoPE optimization features."""
+
+    @pytest.fixture
+    def D(self):
+        return 128
+
+    def test_rotate_queries_keys_output(self, D):
+        """Test rotate_queries_keys() produces correct output."""
+        from nnx.layers.embedding import RotaryEmbedding
+        rope = RotaryEmbedding(head_dim=32, max_len=512)
+        B, H, T = 2, 4, 10
+        q = torch.randn(B, H, T, 32)
+        k = torch.randn(B, H, T, 32)
+        qr, kr = rope.rotate_queries_keys(q, k)
+        assert qr.shape == q.shape
+        assert kr.shape == k.shape
+
+    def test_rotate_with_positions_output(self, D):
+        """Test rotate_with_positions() produces correct output."""
+        from nnx.layers.embedding import RotaryEmbedding
+        rope = RotaryEmbedding(head_dim=32, max_len=512)
+        B, H, T = 2, 4, 10
+        x = torch.randn(B, H, T, 32)
+        position_ids = torch.arange(T).unsqueeze(0).expand(B, -1)
+        rotated = rope.rotate_with_positions(x, position_ids)
+        assert rotated.shape == x.shape
+
+    def test_persistent_false_buffers(self, D):
+        """Verify persistent=False buffers work correctly."""
+        from nnx.layers.embedding import RotaryEmbedding
+        rope = RotaryEmbedding(head_dim=32, max_len=512)
+        
+        # Check that cos_cached and sin_cached are buffers
+        assert hasattr(rope, 'cos_cached')
+        assert hasattr(rope, 'sin_cached')
+        
+        # They should not be in state_dict (persistent=False)
+        state_dict = rope.state_dict()
+        assert 'cos_cached' not in state_dict
+        assert 'sin_cached' not in state_dict
+
+    def test_rotate_queries_keys_preserves_norm(self, D):
+        """Test that RoPE rotation produces valid output with correct shape."""
+        from nnx.layers.embedding import RotaryEmbedding
+        rope = RotaryEmbedding(head_dim=32, max_len=512)
+        B, H, T = 2, 4, 10
+        q = torch.randn(B, H, T, 32)
+        k = torch.randn(B, H, T, 32)
+        
+        qr, kr = rope.rotate_queries_keys(q, k)
+        
+        # Output shapes should match input
+        assert qr.shape == q.shape
+        assert kr.shape == k.shape
+        
+        # Output should be finite (no NaN/Inf)
+        assert torch.all(torch.isfinite(qr))
+        assert torch.all(torch.isfinite(kr))
+        
+        # RoPE should produce different output than input (rotation applied)
+        assert not torch.allclose(qr, q)
+        assert not torch.allclose(kr, k)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

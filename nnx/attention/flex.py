@@ -74,8 +74,15 @@ class FlexAttention(BaseAttention):
         bias: bool = True,
         head_dim: Optional[int] = None,
         score_mod: Optional[Callable] = None,
-        block_mask=None, ) -> None:
-        super().__init__(embed_dim, num_heads, dropout, bias, head_dim)
+        block_mask=None,
+        num_key_value_heads: Optional[int] = None,
+        use_cache: bool = False,
+    ) -> None:
+        super().__init__(
+            embed_dim, num_heads, dropout, bias, head_dim,
+            num_key_value_heads=num_key_value_heads,
+            use_cache=use_cache,
+        )
         self.score_mod = score_mod
         self.block_mask = block_mask
         self._flex_attention, _ = _import_flex()
@@ -87,6 +94,7 @@ class FlexAttention(BaseAttention):
         v: torch.Tensor,
         attn_bias: Optional[torch.Tensor],
         position_ids: Optional[torch.Tensor],
+        is_causal: bool = False,
     ) -> torch.Tensor:
         # flex_attention uses score_mod for custom biases; additive biases
         # from padding masks are composed on top if provided.
