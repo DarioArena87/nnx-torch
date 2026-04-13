@@ -223,12 +223,22 @@ class RotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.head_dim = head_dim
+        self.max_len = max_len
+        self.dtype = dtype
         self.base = base
 
+    @property
+    def base(self) -> float:
+        return self._base
+
+    @base.setter
+    def base(self, base: float):
+        self._base = base
+
         # Pre-compute cos/sin cache
-        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._build_cache(max_len, dtype)
+        self._build_cache(self.max_len, self.dtype)
 
     def _build_cache(self, seq_len: int, dtype: torch.dtype) -> None:
         t = torch.arange(seq_len, device=self.inv_freq.device, dtype=torch.float32)
