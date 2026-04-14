@@ -9,6 +9,7 @@ from .embedding import (
     ALiBiEmbedding,
 )
 from .transformer import TransformerLayer, TransformerStack, CrossAttentionLayer
+from .pooling import LatentPooler
 
 try:
     from fla.modules import RMSNormLinear, LayerNormLinear, GroupNormLinear
