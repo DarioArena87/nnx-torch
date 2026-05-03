@@ -183,7 +183,7 @@ class MoEFFN(nn.Module):
     def __init__(
         self,
         embed_dim: int,
-        ffn_dim: int = 2048,
+        ffn_dim: Optional[int] = None,
         num_experts: int = 8,
         top_k: int = 2,
         expert_cls=None,
