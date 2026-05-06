@@ -117,6 +117,7 @@ class TransformerLayer(nn.Module):
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         key: Optional[torch.Tensor] = None,
         value: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -126,7 +127,7 @@ class TransformerLayer(nn.Module):
         if self.pre_norm:
             x = self.norm1(x)
 
-        x = self.self_attn(x, key=key, value=value, attention_mask=attention_mask, causal=self.causal)
+        x = self.self_attn(x, key=key, value=value, attention_mask=attention_mask, position_ids=position_ids, causal=self.causal)
         x = self.drop(x) + residual
 
         if not self.pre_norm:
@@ -148,6 +149,7 @@ class TransformerLayer(nn.Module):
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         key: Optional[torch.Tensor] = None,
         value: Optional[torch.Tensor] = None, ) -> torch.Tensor:
         """
@@ -155,6 +157,7 @@ class TransformerLayer(nn.Module):
             x:              (B, T, D) input.
             attention_mask: HF-style (B, T) or (B, 1, 1, T) additive mask.
                             1/True = real token, 0/False = padding.
+            position_ids:   Optional (B, Tk) position ids for attention layer.
             key:            Optional (B, Tk, D) for cross-attention.
             value:          Optional (B, Tk, D) for cross-attention.
 
@@ -163,9 +166,9 @@ class TransformerLayer(nn.Module):
         """
         if self.gradient_checkpointing and self.training:
             return checkpoint(
-                self._forward_impl, x, attention_mask, key, value, use_reentrant=False
+                self._forward_impl, x, attention_mask, position_ids, key, value, use_reentrant=False
             )
-        return self._forward_impl(x, attention_mask, key, value)
+        return self._forward_impl(x, attention_mask, position_ids, key, value)
 
 
 # ---------------------------------------------------------------------------
@@ -420,12 +423,14 @@ class TransformerStack(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             x:              (B, T, D) input embeddings.
             attention_mask: HF-style (B, T) mask.
+            position_ids: (B, T) position ids.
 
         Returns:
             (B, T, D) output.
@@ -442,7 +447,7 @@ class TransformerStack(nn.Module):
             x, attention_mask = self._to_nested_tensor(x, attention_mask)
         
         for layer in self.layers:
-            x = layer(x, attention_mask=attention_mask)
+            x = layer(x, attention_mask=attention_mask, position_ids=position_ids)
 
         if self.final_norm is not None:
             x = self.final_norm(x)

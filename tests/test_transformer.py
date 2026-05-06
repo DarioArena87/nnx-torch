@@ -539,7 +539,11 @@ class TestNestedTensor:
         mask[1, 9:] = False  # second seq has 9 real tokens
         return mask
 
-    def test_nested_tensor_basic(self, x, mask, D):
+    @pytest.fixture
+    def position_ids(self, B, T):
+        return torch.vstack([torch.randint(low=0, high=4096, size=(T,)) for i in range(B)])
+
+    def test_nested_tensor_basic(self, x, mask, D, position_ids):
         """Test TransformerStack with use_nested_tensor=True."""
         # NestedTensor has issues with gradient checkpointing in some PyTorch versions
         # Use eval mode to avoid checkpointing issues
@@ -548,10 +552,10 @@ class TestNestedTensor:
         )
         stack.eval()
         with torch.no_grad():
-            out = stack(x, attention_mask=mask)
+            out = stack(x, attention_mask=mask, position_ids=position_ids)
         assert out.shape == x.shape
 
-    def test_nested_tensor_variable_lengths(self, D):
+    def test_nested_tensor_variable_lengths(self, D, position_ids):
         """Test with variable-length sequences (different padding masks)."""
         B = 3
         T = 15
@@ -567,19 +571,19 @@ class TestNestedTensor:
         )
         stack.eval()
         with torch.no_grad():
-            out = stack(x, attention_mask=mask)
+            out = stack(x, attention_mask=mask, position_ids=position_ids)
         assert out.shape == x.shape
 
-    def test_nested_tensor_fallback(self, x, D):
+    def test_nested_tensor_fallback(self, x, D, position_ids):
         """Test fallback when use_nested_tensor=False."""
         mask = torch.ones(2, 10, dtype=torch.bool)
         stack = TransformerStack(
             n_layers=2, embed_dim=D, num_heads=4, use_nested_tensor=False
         )
-        out = stack(x, attention_mask=mask)
+        out = stack(x, attention_mask=mask, position_ids=position_ids)
         assert out.shape == x.shape
 
-    def test_nested_tensor_without_mask(self, x, D):
+    def test_nested_tensor_without_mask_or_position_ids(self, x, D):
         """Test that without mask, NestedTensor is not used."""
         stack = TransformerStack(
             n_layers=2, embed_dim=D, num_heads=4, use_nested_tensor=True
